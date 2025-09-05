@@ -8,6 +8,7 @@ import (
 
 	cli "github.com/spf13/pflag"
 
+	"achtung/internal/achtung"
 	"achtung/pkg/protocol"
 )
 
@@ -39,13 +40,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	acht := achtung.NewAchtung(ptcl)
+
 	log.Info("BOOTING UP", "url", ptcl_cfg.Url)
 
 	go ptcl.Run()
 
 	for {
-		cmd := ptcl.Receive()
+		_, args, from := ptcl.Parse(ptcl.Receive())
+		log.Info("Got msg", "args", args, "from", from)
 
-		log.Info("Got msg", "msg", string(cmd))
+		acht.Cmd(from, args)
 	}
 }

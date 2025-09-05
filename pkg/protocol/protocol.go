@@ -56,9 +56,9 @@ func (ptcl *Protocol) TransmitReceive(parts ...string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp := <- ptcl.resp
+	resp := <-ptcl.resp
 	for !ptcl.checkRecipient(resp) {
-		resp = <- ptcl.resp
+		resp = <-ptcl.resp
 	}
 	return resp, nil
 }
@@ -70,11 +70,16 @@ func (ptcl *Protocol) Transmit(parts ...string) error {
 }
 
 func (ptcl *Protocol) Receive() []byte {
-	resp := <- ptcl.resp
+	resp := <-ptcl.resp
 	for !ptcl.checkRecipient(resp) {
-		resp = <- ptcl.resp
+		resp = <-ptcl.resp
 	}
 	return resp
+}
+
+func (ptcl *Protocol) Parse(msg []byte) (string, []string, string) {
+	parts := strings.Split(string(msg), ":")
+	return parts[0], parts[1 : len(parts)-1], parts[len(parts)-1]
 }
 
 func (ptcl *Protocol) OnDisconnect(f func()) { ptcl.onDisconnect = f }
