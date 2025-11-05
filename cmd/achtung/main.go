@@ -19,6 +19,7 @@ var logLevelMap = map[string]log.Level{
 	"error": log.LevelError,
 }
 
+
 func main() {
 	url := cli.StringP("url", "u", "ws://localhost:8092", "Url of hub")
 	logLevel := cli.StringP("log", "l", "info", "Log level")
@@ -42,14 +43,19 @@ func main() {
 
 	acht := achtung.NewAchtung(ptcl)
 
+	messages := make(chan *protocol.Message, 16)
+	ptcl.EmitOut(func (m *protocol.Message) {
+		messages <- m
+	})
+
 	log.Info("BOOTING UP", "url", ptcl_cfg.Url)
 
 	go ptcl.Run()
 
 	for {
-		_, args, from := ptcl.Parse(ptcl.Receive())
-		log.Info("Got msg", "args", args, "from", from)
-
-		acht.Cmd(from, args)
+		for msg := range messages {
+			log.Info("Got new income", "msg", msg)
+			acht.Cmd(msg)
+		}
 	}
 }

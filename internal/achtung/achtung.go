@@ -4,7 +4,7 @@ import (
 	"achtung/pkg/protocol"
 	"fmt"
 	log "log/slog"
-	"strconv"
+	_ "strconv"
 	"strings"
 	"time"
 )
@@ -36,12 +36,16 @@ func (a *Achtung) Shutdown() { a.sched.Shutdown() }
 //	DELETE TIMER WASHING_MACHINE
 //	PAUSE TIMER WASHING_MACHINE
 //	RESUME TIMER WASHING_MACHINE
-func (a *Achtung) Cmd(from string, args []string) {
-	if len(args) == 0 {
-		a.ptcl.Transmit(from, "ERR:ARGS")
-		return
-	}
-	switch args[0] {
+func (a *Achtung) Cmd(msg *protocol.Message) {
+	resp := protocol.Message{To: msg.From}
+	defer func() { _ = a.ptcl.Transmit(resp) }()
+
+	switch msg.Verb {
+	case "NEW":
+		a.cmdNew(msg, &resp)
+	case "STOP":
+		a.cmdStop(msg, &resp)
+			/*
 	case "SET":
 		a.cmdSet(from, args[1:])
 	case "GET":
@@ -52,26 +56,76 @@ func (a *Achtung) Cmd(from string, args []string) {
 		a.cmdPause(from, args[1:])
 	case "RESUME":
 		a.cmdResume(from, args[1:])
+		*/
 	default:
-		a.ptcl.Transmit(from, "VERB:UNK")
+		resp.Error("VERB")
 	}
 }
 
+func (a *Achtung) cmdNew(msg, resp *protocol.Message) {
+	switch msg.Noun {
+	case "TIMER":
+		if len(msg.Args) < 2 {
+			resp.Error("ARGC")
+			return
+		}
+		name := msg.Args[0]
+		d, err := time.ParseDuration(msg.Args[1])
+		if err != nil {
+			resp.Error("DUR")
+			return
+		}
+
+		job := Job{
+			Name: name, Kind: KindTimer,
+			Due: time.Now().Add(d),
+		}
+		if err := a.sched.Add(job); err != nil {
+			resp.Error("ADD", "JOB", err.Error())
+			return
+		}
+		resp.Ok("TIMER", name)
+
+	default:
+		resp.Error("NOUN")
+	}
+
+}
+
+func (a *Achtung) cmdStop(msg, resp *protocol.Message) {
+	switch msg.Noun {
+	case "TIMER":
+		if len(msg.Args) < 1 {
+			resp.Error("ARGC")
+			return
+		}
+		name := msg.Args[0]
+		a.ptcl.TransmitReceive("VERTEX:BUZZ:OFF")
+
+		resp.Ok("TIMER", name)
+
+	default:
+		resp.Error("NOUN")
+	}
+
+}
+
+/*
 func (a *Achtung) cmdSet(from string, args []string) {
 	if len(args) < 1 {
-		a.ptcl.Transmit(from, "ARGC:LESS")
+		a.ptcl.Transmit("ARGC:LESS")
 		return
 	}
 	switch args[0] {
 	case "TIMER":
 		if len(args) < 3 {
-			a.ptcl.Transmit(from, "ARGC:LESS")
+			a.ptcl.Transmit("ARGC:LESS")
 			return
 		}
 		name := args[1]
 		d, err := time.ParseDuration(args[2])
 		if err != nil {
-			a.ptcl.Transmit(from, "DUR:BAD", args[2])
+			a.ptcl.Transmit([]string{"DUR:BAD", args[2]})
 			return
 		}
 		data := args[3:]
@@ -80,10 +134,10 @@ func (a *Achtung) cmdSet(from string, args []string) {
 			Due: time.Now().Add(d), Data: data,
 		}
 		if err := a.sched.Add(job); err != nil {
-			a.ptcl.Transmit(from, "SET:ERR", err.Error())
+			a.ptcl.Transmit([]string{"SET:ERR", err.Error()})
 			return
 		}
-		a.ptcl.Transmit(from, "SET:OK:TIMER", name, d.String())
+		a.ptcl.Transmit([]string{"SET:OK:TIMER", name, d.String()})
 
 	case "ALARM":
 		if len(args) < 3 {
@@ -130,7 +184,7 @@ func (a *Achtung) cmdSet(from string, args []string) {
 		a.ptcl.Transmit(from, "SET:OK:EVERY", name, intv.String())
 
 	default:
-		a.ptcl.Transmit(from, "NOUN:UNK")
+		a.ptcl.Transmit("NOUN:UNK")
 	}
 }
 
@@ -217,15 +271,15 @@ func (a *Achtung) cmdResume(from string, args []string) {
 	}
 }
 
+*/
+
 func (a *Achtung) eventLoop() {
 	for ev := range a.sched.Events() {
 		j := ev.Job
-		payload := "CB:" + strings.ToUpper(kindStr(j.Kind)) + ":" + j.Name
-		if len(j.Data) > 0 {
-			payload += ":" + strings.Join(j.Data, ":")
-		}
-		log.Info("FIRE", "name", j.Name, "kind", kindStr(j.Kind), "from", j.From)
-		a.ptcl.Transmit(j.From, payload)
+		payload := "FIRE:" + strings.ToUpper(kindStr(j.Kind)) + ":" + j.Name
+		log.Info("FIRE", "name", j.Name, "kind", kindStr(j.Kind))
+		a.ptcl.TransmitReceive([]string{"LUCH", payload})
+		a.ptcl.TransmitReceive("VERTEX:BUZZ:ON")
 	}
 }
 
