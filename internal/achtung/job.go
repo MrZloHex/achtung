@@ -13,7 +13,7 @@ const (
 )
 
 type Job struct {
-	Name     string
+	Name string
 	//From     string
 	Kind     JobKind
 	Due      time.Time     // next fire time (absolute)

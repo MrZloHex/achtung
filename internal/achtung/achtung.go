@@ -45,17 +45,19 @@ func (a *Achtung) Cmd(msg *protocol.Message) {
 		a.cmdNew(msg, &resp)
 	case "STOP":
 		a.cmdStop(msg, &resp)
-			/*
-	case "SET":
-		a.cmdSet(from, args[1:])
 	case "GET":
-		a.cmdGet(from, args[1:])
-	case "DELETE":
-		a.cmdDelete(from, args[1:])
-	case "PAUSE":
-		a.cmdPause(from, args[1:])
-	case "RESUME":
-		a.cmdResume(from, args[1:])
+		a.cmdGet(msg, &resp)
+		/*
+			case "SET":
+				a.cmdSet(from, args[1:])
+			case "GET":
+				a.cmdGet(from, args[1:])
+			case "DELETE":
+				a.cmdDelete(from, args[1:])
+			case "PAUSE":
+				a.cmdPause(from, args[1:])
+			case "RESUME":
+				a.cmdResume(from, args[1:])
 		*/
 	default:
 		resp.Error("VERB")
@@ -86,6 +88,27 @@ func (a *Achtung) cmdNew(msg, resp *protocol.Message) {
 		}
 		resp.Ok("TIMER", name)
 
+	case "ALARM":
+		if len(msg.Args) < 3 {
+			resp.Error("ARGC")
+			return
+		}
+		name := msg.Args[0]
+		tm, err := parseTimeLocal(msg.Args[1], msg.Args[2])
+		if err != nil {
+			resp.Error("TIME", msg.Args[1], msg.Args[2])
+			return
+		}
+		job := Job{
+			Name: name, Kind: KindAlarm,
+			Due: tm,
+		}
+		if err := a.sched.Add(job); err != nil {
+			resp.Error("ADD", "JOB", err.Error())
+			return
+		}
+		resp.Ok("ALARM", name)
+
 	default:
 		resp.Error("NOUN")
 	}
@@ -104,90 +127,65 @@ func (a *Achtung) cmdStop(msg, resp *protocol.Message) {
 
 		resp.Ok("TIMER", name)
 
+	case "ALARM":
+		if len(msg.Args) < 1 {
+			resp.Error("ARGC")
+			return
+		}
+		name := msg.Args[0]
+		a.ptcl.TransmitReceive("VERTEX:BUZZ:OFF")
+
+		resp.Ok("ALARM", name)
+
 	default:
 		resp.Error("NOUN")
 	}
 
 }
 
-/*
-func (a *Achtung) cmdSet(from string, args []string) {
-	if len(args) < 1 {
-		a.ptcl.Transmit("ARGC:LESS")
-		return
-	}
-	switch args[0] {
-	case "TIMER":
-		if len(args) < 3 {
-			a.ptcl.Transmit("ARGC:LESS")
+func (a *Achtung) cmdGet(msg, resp *protocol.Message) {
+	switch msg.Noun {
+	case "LIST":
+		jobs := a.sched.List()
+		now := time.Now()
+		var list string
+		for id, j := range jobs {
+			if !j.Active {
+				continue
+			}
+			kind := kindStr(j.Kind)
+			rem := j.Due.Sub(now).Truncate(time.Second)
+			if rem < 0 {
+				rem = 0
+			}
+			list += fmt.Sprintf("%s:%s:", kind, j.Name)
+			log.Info("", "id", id, "name", j.Name, "kind", kind)
+		}
+		list = list[:len(list)-1]
+		resp.Ok("LIST", list)
+	case "JOB":
+		if len(msg.Args) < 1 {
+			resp.Error("ARGC")
 			return
 		}
-		name := args[1]
-		d, err := time.ParseDuration(args[2])
-		if err != nil {
-			a.ptcl.Transmit([]string{"DUR:BAD", args[2]})
+		name := msg.Args[0]
+		j, ok := a.sched.Get(name)
+		if !ok || !j.Active {
+			resp.Error("NAC")
 			return
 		}
-		data := args[3:]
-		job := Job{
-			Name: name, From: from, Kind: KindTimer,
-			Due: time.Now().Add(d), Data: data,
+		now := time.Now()
+		rem := j.Due.Sub(now).Truncate(time.Second)
+		if rem < 0 {
+			rem = 0
 		}
-		if err := a.sched.Add(job); err != nil {
-			a.ptcl.Transmit([]string{"SET:ERR", err.Error()})
-			return
-		}
-		a.ptcl.Transmit([]string{"SET:OK:TIMER", name, d.String()})
-
-	case "ALARM":
-		if len(args) < 3 {
-			a.ptcl.Transmit(from, "ARGC:LESS")
-			return
-		}
-		name := args[1]
-		tm, err := parseTimeLocal(args[2], args[3])
-		if err != nil {
-			a.ptcl.Transmit(from, "TIME:BAD", args[2], args[3])
-			return
-		}
-		data := args[4:]
-		job := Job{
-			Name: name, From: from, Kind: KindAlarm,
-			Due: tm, Data: data,
-		}
-		if err := a.sched.Add(job); err != nil {
-			a.ptcl.Transmit(from, "SET:ERR", err.Error())
-			return
-		}
-		a.ptcl.Transmit(from, "SET:OK:ALARM", name, tm.Format(time.RFC3339))
-
-	case "EVERY":
-		if len(args) < 3 {
-			a.ptcl.Transmit(from, "ARGC:LESS")
-			return
-		}
-		name := args[1]
-		intv, err := time.ParseDuration(args[2])
-		if err != nil || intv <= 0 {
-			a.ptcl.Transmit(from, "INTV:BAD", args[2])
-			return
-		}
-		data := args[3:]
-		job := Job{
-			Name: name, From: from, Kind: KindEvery,
-			Due: time.Now().Add(intv), Interval: intv, Data: data,
-		}
-		if err := a.sched.Add(job); err != nil {
-			a.ptcl.Transmit(from, "SET:ERR", err.Error())
-			return
-		}
-		a.ptcl.Transmit(from, "SET:OK:EVERY", name, intv.String())
-
+		resp.Ok("JOB", kindStr(j.Kind), j.Name, rem.String(), serializeTimeLocal(j.Due))
 	default:
-		a.ptcl.Transmit("NOUN:UNK")
+		resp.Error("NOUN")
 	}
 }
 
+/*
 func (a *Achtung) cmdGet(from string, args []string) {
 	if len(args) < 1 {
 		a.ptcl.Transmit(from, "ARGC:LESS")
@@ -308,4 +306,8 @@ func parseTimeLocal(d, t string) (time.Time, error) {
 	}
 
 	return time.Date(year, time.Month(month), day, hour, minute, 0, 0, time.Local), nil
+}
+
+func serializeTimeLocal(t time.Time) string {
+	return fmt.Sprintf("%d.%d.%d:%d.%d", t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute())
 }

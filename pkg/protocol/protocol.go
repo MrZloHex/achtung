@@ -72,7 +72,6 @@ func (ptcl *Protocol) Transmit(v any) error {
 		return fmt.Errorf("Unsupported type")
 	}
 
-
 	err := ptcl.ws.Write([]byte(msg))
 	if err != nil {
 		log.Error("Failed to transmit", "msg", msg, "err", err)
