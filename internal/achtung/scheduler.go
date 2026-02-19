@@ -247,38 +247,52 @@ func (s *Scheduler) resumeJob(name string) bool {
 }
 
 func (s *Scheduler) armTimer() {
-	// Stop previous timer
 	if s.t != nil {
 		s.t.Stop()
 		s.t = nil
 	}
-	// Peek next active, unpaused item
-	//now := time.Now()
+
+	var paused []*jitem
 	for s.h.Len() > 0 {
 		top := s.h[0]
-		if !top.job.Active || top.job.Paused {
-			heap.Pop(&s.h) // drop inactive/paused placeholders
+		if !top.job.Active {
+			heap.Pop(&s.h)
 			continue
 		}
-		// If due time is past, trigger immediately via short timer
+		if top.job.Paused {
+			paused = append(paused, top)
+			heap.Pop(&s.h)
+			continue
+		}
 		d := time.Until(top.job.Due)
 		if d <= 0 {
 			d = 0
 		}
 		s.next = top.job.Due
 		s.t = time.NewTimer(d)
+		for _, p := range paused {
+			heap.Push(&s.h, p)
+		}
 		return
 	}
-	// nothing to arm
+
+	for _, p := range paused {
+		heap.Push(&s.h, p)
+	}
 	s.next = time.Time{}
 }
 
 func (s *Scheduler) onTick() {
 	now := time.Now()
+	var paused []*jitem
 	for s.h.Len() > 0 {
 		top := s.h[0]
-		// skip inactive / paused
-		if !top.job.Active || top.job.Paused {
+		if !top.job.Active {
+			heap.Pop(&s.h)
+			continue
+		}
+		if top.job.Paused {
+			paused = append(paused, top)
 			heap.Pop(&s.h)
 			continue
 		}
@@ -286,27 +300,25 @@ func (s *Scheduler) onTick() {
 			break
 		}
 		heap.Pop(&s.h)
-		j := top.job // copy
+		j := top.job
 
-		// If still active, emit event and reschedule if repeating
-		if j.Active && !j.Paused {
-			select {
-			case s.events <- Event{Job: j, FiredAt: now}:
-			default:
-				// if consumer is slow, don't block; you can choose to block instead
-			}
+		select {
+		case s.events <- Event{Job: j, FiredAt: now}:
+		default:
 		}
 
-		// repeating?
-		if j.Kind == KindEvery && j.Active {
+		if j.Kind == KindEvery {
 			j.Due = j.Due.Add(j.Interval)
 			top.job = j
 			heap.Push(&s.h, top)
 			s.idx[j.Name] = top
 		} else {
-			// one-shot: mark inactive and drop from idx
 			top.job.Active = false
 			delete(s.idx, j.Name)
 		}
+	}
+
+	for _, p := range paused {
+		heap.Push(&s.h, p)
 	}
 }

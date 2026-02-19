@@ -1,23 +1,23 @@
 package achtung
 
 import (
-	"achtung/pkg/protocol"
+	"achtung/pkg/proto"
 	"fmt"
 	log "log/slog"
-	_ "strconv"
-	"strings"
 	"time"
 )
 
 type Achtung struct {
-	ptcl  *protocol.Protocol
-	sched *Scheduler
+	client   *proto.Client
+	sched    *Scheduler
+	bootedAt time.Time
 }
 
-func NewAchtung(ptcl *protocol.Protocol) *Achtung {
+func NewAchtung(client *proto.Client) *Achtung {
 	a := &Achtung{
-		ptcl:  ptcl,
-		sched: NewScheduler(),
+		client:   client,
+		sched:    NewScheduler(),
+		bootedAt: time.Now(),
 	}
 	go a.eventLoop()
 	return a
@@ -25,78 +25,74 @@ func NewAchtung(ptcl *protocol.Protocol) *Achtung {
 
 func (a *Achtung) Shutdown() { a.sched.Shutdown() }
 
-// Cmd receives tokens after "ACHTUNG:".
-// Examples:
+// Cmd dispatches an incoming request by verb.
 //
-//	SET TIMER WASHING_MACHINE 30m some other stuff
-//	SET ALARM coffee 2025-09-05T21:00:00+03:00 bring:milk
-//	SET EVERY stretch 45m
-//	GET LIST
-//	GET TIMER WASHING_MACHINE
-//	DELETE TIMER WASHING_MACHINE
-//	PAUSE TIMER WASHING_MACHINE
-//	RESUME TIMER WASHING_MACHINE
-func (a *Achtung) Cmd(msg *protocol.Message) {
-	resp := protocol.Message{To: msg.From}
-	defer func() { _ = a.ptcl.Transmit(resp) }()
+//	PING PING               -> PONG PONG
+//	NEW  TIMER <name> <dur> -> OK TIMER <name>
+//	NEW  ALARM <name> <d> <t> -> OK ALARM <name>
+//	STOP TIMER|ALARM <name> -> OK <kind> <name>
+//	GET  LIST               -> OK LIST [<kind> <name>...]
+//	GET  JOB <name>         -> OK JOB <kind> <name> <rem> <due>
+//	GET  UPTIME             -> OK UPTIME <dur>
+func (a *Achtung) Cmd(req *proto.Request) {
+	msg := req.Msg
+	log.Debug("CMD", "from", msg.From, "verb", msg.Verb, "noun", msg.Noun, "args", msg.Args)
 
 	switch msg.Verb {
+	case "OK", "ERR", "PONG":
+		log.Debug("IGNORE", "verb", msg.Verb, "noun", msg.Noun, "from", msg.From)
+		return
+	case "PING":
+		req.Reply("PONG", "PONG")
 	case "NEW":
-		a.cmdNew(msg, &resp)
+		a.cmdNew(req)
 	case "STOP":
-		a.cmdStop(msg, &resp)
+		a.cmdStop(req)
 	case "GET":
-		a.cmdGet(msg, &resp)
-		/*
-			case "SET":
-				a.cmdSet(from, args[1:])
-			case "GET":
-				a.cmdGet(from, args[1:])
-			case "DELETE":
-				a.cmdDelete(from, args[1:])
-			case "PAUSE":
-				a.cmdPause(from, args[1:])
-			case "RESUME":
-				a.cmdResume(from, args[1:])
-		*/
+		a.cmdGet(req)
 	default:
-		resp.Error("VERB")
+		log.Warn("UNKNOWN VERB", "verb", msg.Verb, "from", msg.From)
+		req.Reply("ERR", "VERB")
 	}
 }
 
-func (a *Achtung) cmdNew(msg, resp *protocol.Message) {
+func (a *Achtung) cmdNew(req *proto.Request) {
+	msg := req.Msg
 	switch msg.Noun {
 	case "TIMER":
 		if len(msg.Args) < 2 {
-			resp.Error("ARGC")
+			req.Reply("ERR", "ARGC")
 			return
 		}
 		name := msg.Args[0]
 		d, err := time.ParseDuration(msg.Args[1])
 		if err != nil {
-			resp.Error("DUR")
+			log.Warn("BAD DURATION", "raw", msg.Args[1], "from", msg.From)
+			req.Reply("ERR", "DUR")
 			return
 		}
-
 		job := Job{
 			Name: name, Kind: KindTimer,
 			Due: time.Now().Add(d),
 		}
 		if err := a.sched.Add(job); err != nil {
-			resp.Error("ADD", "JOB", err.Error())
+			log.Error("ADD FAILED", "name", name, "err", err)
+			req.Reply("ERR", "ADD", err.Error())
 			return
 		}
-		resp.Ok("TIMER", name)
+		log.Info("NEW TIMER", "name", name, "duration", d, "due", job.Due.Format(time.DateTime), "from", msg.From)
+		req.Reply("OK", "TIMER", name)
 
 	case "ALARM":
 		if len(msg.Args) < 3 {
-			resp.Error("ARGC")
+			req.Reply("ERR", "ARGC")
 			return
 		}
 		name := msg.Args[0]
 		tm, err := parseTimeLocal(msg.Args[1], msg.Args[2])
 		if err != nil {
-			resp.Error("TIME", msg.Args[1], msg.Args[2])
+			log.Warn("BAD TIME", "date", msg.Args[1], "time", msg.Args[2], "from", msg.From)
+			req.Reply("ERR", "TIME", msg.Args[1], msg.Args[2])
 			return
 		}
 		job := Job{
@@ -104,180 +100,99 @@ func (a *Achtung) cmdNew(msg, resp *protocol.Message) {
 			Due: tm,
 		}
 		if err := a.sched.Add(job); err != nil {
-			resp.Error("ADD", "JOB", err.Error())
+			log.Error("ADD FAILED", "name", name, "err", err)
+			req.Reply("ERR", "ADD", err.Error())
 			return
 		}
-		resp.Ok("ALARM", name)
+		log.Info("NEW ALARM", "name", name, "due", tm.Format(time.DateTime), "from", msg.From)
+		req.Reply("OK", "ALARM", name)
 
 	default:
-		resp.Error("NOUN")
+		log.Warn("UNKNOWN NOUN", "noun", msg.Noun, "from", msg.From)
+		req.Reply("ERR", "NOUN")
 	}
-
 }
 
-func (a *Achtung) cmdStop(msg, resp *protocol.Message) {
+func (a *Achtung) cmdStop(req *proto.Request) {
+	msg := req.Msg
 	switch msg.Noun {
-	case "TIMER":
+	case "TIMER", "ALARM":
 		if len(msg.Args) < 1 {
-			resp.Error("ARGC")
+			req.Reply("ERR", "ARGC")
 			return
 		}
 		name := msg.Args[0]
-		a.ptcl.TransmitReceive("VERTEX:BUZZ:OFF")
-
-		resp.Ok("TIMER", name)
-
-	case "ALARM":
-		if len(msg.Args) < 1 {
-			resp.Error("ARGC")
-			return
+		ok := a.sched.Delete(name)
+		if !ok {
+			log.Warn("STOP NOT FOUND", "kind", msg.Noun, "name", name, "from", msg.From)
+		} else {
+			log.Info("STOP", "kind", msg.Noun, "name", name, "from", msg.From)
 		}
-		name := msg.Args[0]
-		a.ptcl.TransmitReceive("VERTEX:BUZZ:OFF")
-
-		resp.Ok("ALARM", name)
+		a.client.Send("VERTEX", "OFF", "BUZZ")
+		req.Reply("OK", msg.Noun, name)
 
 	default:
-		resp.Error("NOUN")
+		log.Warn("UNKNOWN NOUN", "noun", msg.Noun, "from", msg.From)
+		req.Reply("ERR", "NOUN")
 	}
-
 }
 
-func (a *Achtung) cmdGet(msg, resp *protocol.Message) {
+func (a *Achtung) cmdGet(req *proto.Request) {
+	msg := req.Msg
 	switch msg.Noun {
 	case "LIST":
 		jobs := a.sched.List()
-		now := time.Now()
-		var list string
-		for id, j := range jobs {
-			if !j.Active {
-				continue
-			}
-			kind := kindStr(j.Kind)
-			rem := j.Due.Sub(now).Truncate(time.Second)
-			if rem < 0 {
-				rem = 0
-			}
-			list += fmt.Sprintf("%s:%s:", kind, j.Name)
-			log.Info("", "id", id, "name", j.Name, "kind", kind)
-		}
-		list = list[:len(list)-1]
-		resp.Ok("LIST", list)
-	case "JOB":
-		if len(msg.Args) < 1 {
-			resp.Error("ARGC")
-			return
-		}
-		name := msg.Args[0]
-		j, ok := a.sched.Get(name)
-		if !ok || !j.Active {
-			resp.Error("NAC")
-			return
-		}
-		now := time.Now()
-		rem := j.Due.Sub(now).Truncate(time.Second)
-		if rem < 0 {
-			rem = 0
-		}
-		resp.Ok("JOB", kindStr(j.Kind), j.Name, rem.String(), serializeTimeLocal(j.Due))
-	default:
-		resp.Error("NOUN")
-	}
-}
-
-/*
-func (a *Achtung) cmdGet(from string, args []string) {
-	if len(args) < 1 {
-		a.ptcl.Transmit(from, "ARGC:LESS")
-		return
-	}
-	switch strings.ToUpper(args[0]) {
-	case "LIST":
-		jobs := a.sched.List()
-		a.ptcl.Transmit(from, "TIMER:LIST", strconv.Itoa(len(jobs)))
-		now := time.Now()
+		var parts []string
 		for _, j := range jobs {
 			if !j.Active {
 				continue
 			}
-			kind := kindStr(j.Kind)
-			rem := j.Due.Sub(now).Truncate(time.Second)
-			if rem < 0 {
-				rem = 0
-			}
-			a.ptcl.Transmit(from, "TIMER:INFO", j.Name, kind, rem.String(), j.Due.Format(time.RFC3339), j.From)
+			parts = append(parts, kindStr(j.Kind), j.Name)
 		}
-	case "TIMER":
-		if len(args) < 2 {
-			a.ptcl.Transmit(from, "ARGC:LESS")
+		log.Debug("GET LIST", "count", len(parts)/2, "from", msg.From)
+		if len(parts) == 0 {
+			req.Reply("OK", "LIST")
 			return
 		}
-		name := args[1]
+		req.Reply("OK", "LIST", parts...)
+
+	case "UPTIME":
+		uptime := time.Since(a.bootedAt).Truncate(time.Second)
+		log.Debug("GET UPTIME", "uptime", uptime, "from", msg.From)
+		req.Reply("OK", "UPTIME", uptime.String())
+
+	case "JOB":
+		if len(msg.Args) < 1 {
+			req.Reply("ERR", "ARGC")
+			return
+		}
+		name := msg.Args[0]
 		j, ok := a.sched.Get(name)
 		if !ok || !j.Active {
-			a.ptcl.Transmit(from, "TIMER:NF", name)
+			log.Debug("GET JOB NOT FOUND", "name", name, "from", msg.From)
+			req.Reply("ERR", "NAC")
 			return
 		}
-		now := time.Now()
-		rem := j.Due.Sub(now).Truncate(time.Second)
+		rem := time.Until(j.Due).Truncate(time.Second)
 		if rem < 0 {
 			rem = 0
 		}
-		a.ptcl.Transmit(from, "TIMER:LEFT", j.Name, kindStr(j.Kind), rem.String(), j.Due.Format(time.RFC3339))
+		log.Debug("GET JOB", "name", name, "kind", kindStr(j.Kind), "remaining", rem, "from", msg.From)
+		req.Reply("OK", "JOB", kindStr(j.Kind), j.Name, rem.String(), serializeTimeLocal(j.Due))
+
 	default:
-		a.ptcl.Transmit(from, "NOUN:UNK")
+		log.Warn("UNKNOWN NOUN", "noun", msg.Noun, "from", msg.From)
+		req.Reply("ERR", "NOUN")
 	}
 }
-
-func (a *Achtung) cmdDelete(from string, args []string) {
-	if len(args) < 2 || strings.ToUpper(args[0]) != "TIMER" {
-		a.ptcl.Transmit(from, "ARGC:LESS")
-		return
-	}
-	name := args[1]
-	ok := a.sched.Delete(name)
-	if !ok {
-		a.ptcl.Transmit(from, "TIMER:NF", name)
-		return
-	}
-	a.ptcl.Transmit(from, "DELETE:OK:TIMER", name)
-}
-
-func (a *Achtung) cmdPause(from string, args []string) {
-	if len(args) < 2 || strings.ToUpper(args[0]) != "TIMER" {
-		a.ptcl.Transmit(from, "ARGC:LESS")
-		return
-	}
-	name := args[1]
-	if a.sched.Pause(name) {
-		a.ptcl.Transmit(from, "PAUSE:OK:TIMER", name)
-	} else {
-		a.ptcl.Transmit(from, "TIMER:NF", name)
-	}
-}
-
-func (a *Achtung) cmdResume(from string, args []string) {
-	if len(args) < 2 || strings.ToUpper(args[0]) != "TIMER" {
-		a.ptcl.Transmit(from, "ARGC:LESS")
-		return
-	}
-	name := args[1]
-	if a.sched.Resume(name) {
-		a.ptcl.Transmit(from, "RESUME:OK:TIMER", name)
-	} else {
-		a.ptcl.Transmit(from, "TIMER:NF", name)
-	}
-}
-
-*/
 
 func (a *Achtung) eventLoop() {
 	for ev := range a.sched.Events() {
 		j := ev.Job
-		payload := "FIRE:" + strings.ToUpper(kindStr(j.Kind)) + ":" + j.Name
-		log.Info("FIRE", "name", j.Name, "kind", kindStr(j.Kind))
-		a.ptcl.TransmitReceive([]string{"LUCH", payload})
-		a.ptcl.TransmitReceive("VERTEX:BUZZ:ON")
+		kind := kindStr(j.Kind)
+		log.Info("FIRE", "kind", kind, "name", j.Name)
+		a.client.Send("ALL", "FIRE", kind, j.Name)
+		a.client.Send("VERTEX", "ON", "BUZZ")
 	}
 }
 
@@ -298,13 +213,12 @@ func parseTimeLocal(d, t string) (time.Time, error) {
 	var year, month, day, hour, minute int
 	_, err := fmt.Sscanf(d, "%d.%d.%d", &year, &month, &day)
 	if err != nil {
-		return time.Now(), err
+		return time.Time{}, err
 	}
 	_, err = fmt.Sscanf(t, "%d.%d", &hour, &minute)
 	if err != nil {
-		return time.Now(), err
+		return time.Time{}, err
 	}
-
 	return time.Date(year, time.Month(month), day, hour, minute, 0, 0, time.Local), nil
 }
 

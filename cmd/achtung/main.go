@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/lmittmann/tint"
 	log "log/slog"
@@ -9,7 +13,7 @@ import (
 	cli "github.com/spf13/pflag"
 
 	"achtung/internal/achtung"
-	"achtung/pkg/protocol"
+	"achtung/pkg/proto"
 )
 
 var logLevelMap = map[string]log.Level{
@@ -28,33 +32,31 @@ func main() {
 		Level: logLevelMap[*logLevel],
 	})))
 
-	ptcl_cfg := protocol.PtclConfig{
-		Shard:  "ACHTUNG",
-		Url:    *url,
-		Reconn: 5,
-	}
+	client := proto.New("ACHTUNG", *url,
+		proto.WithReconnect(5*time.Second),
+	)
 
-	ptcl, err := protocol.NewProtocol(ptcl_cfg)
-	if err != nil {
-		log.Error("Failed to init protocol")
+	acht := achtung.NewAchtung(client)
+
+	client.Handle("*", func(req *proto.Request) {
+		if req.Msg.To != client.NodeID() {
+			return
+		}
+		acht.Cmd(req)
+	})
+
+	log.Info("BOOTING UP", "url", *url)
+
+	if err := client.Connect(context.Background()); err != nil {
+		log.Error("Failed to connect", "err", err)
 		os.Exit(1)
 	}
 
-	acht := achtung.NewAchtung(ptcl)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
 
-	messages := make(chan *protocol.Message, 16)
-	ptcl.EmitOut(func(m *protocol.Message) {
-		messages <- m
-	})
-
-	log.Info("BOOTING UP", "url", ptcl_cfg.Url)
-
-	go ptcl.Run()
-
-	for {
-		for msg := range messages {
-			log.Info("Got new income", "msg", msg)
-			acht.Cmd(msg)
-		}
-	}
+	log.Info("SHUTTING DOWN")
+	acht.Shutdown()
+	client.Close()
 }
