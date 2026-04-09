@@ -2,6 +2,7 @@ package proto
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"strings"
@@ -29,6 +30,11 @@ func WithDialTimeout(d time.Duration) Option {
 	return func(c *Client) { c.dialTimeout = d }
 }
 
+// WithTLS sets the TLS client config for wss:// dials (e.g. client cert for mTLS).
+func WithTLS(cfg *tls.Config) Option {
+	return func(c *Client) { c.tlsConfig = cfg }
+}
+
 // WithOnConnect sets a callback that fires after every successful connection
 // (including reconnects). Useful for re-announcing state to the concentrator.
 func WithOnConnect(fn func(*Client)) Option {
@@ -49,6 +55,7 @@ type Client struct {
 
 	reconnectInterval time.Duration
 	dialTimeout       time.Duration
+	tlsConfig         *tls.Config
 	log               *log.Logger
 	onConnect         func(*Client)
 
@@ -166,7 +173,10 @@ func (c *Client) writeRaw(wire string) error {
 }
 
 func (c *Client) dial(ctx context.Context) error {
-	dialer := websocket.Dialer{HandshakeTimeout: c.dialTimeout}
+	dialer := websocket.Dialer{
+		HandshakeTimeout: c.dialTimeout,
+		TLSClientConfig:  c.tlsConfig,
+	}
 	conn, _, err := dialer.DialContext(ctx, c.url, nil)
 	if err != nil {
 		return err
