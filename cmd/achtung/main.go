@@ -16,7 +16,7 @@ import (
 	cli "github.com/spf13/pflag"
 
 	"achtung/internal/achtung"
-	"achtung/pkg/proto"
+	"github.com/MrZloHex/monolink"
 )
 
 var logLevelMap = map[string]log.Level{
@@ -68,7 +68,7 @@ func main() {
 		Level: logLevelMap[*logLevel],
 	})))
 
-	opts := []proto.Option{proto.WithReconnect(5 * time.Second)}
+	opts := []monolink.Option{monolink.WithReconnect(5 * time.Second)}
 	if *tlsCert != "" || *tlsKey != "" || *tlsServerCA != "" {
 		if *tlsCert == "" || *tlsKey == "" {
 			log.Error("mTLS requires both --tls-cert and --tls-key (or ACHTUNG_TLS_CERT and ACHTUNG_TLS_KEY)")
@@ -78,19 +78,19 @@ func main() {
 			log.Error("mTLS requires a wss:// hub URL", "url", *url)
 			os.Exit(1)
 		}
-		tlsCfg, err := proto.LoadTLSClientConfig(*tlsCert, *tlsKey, *tlsServerCA)
+		tlsCfg, err := monolink.LoadClientTLS(*tlsCert, *tlsKey, *tlsServerCA)
 		if err != nil {
 			log.Error("TLS client configuration failed", "err", err)
 			os.Exit(1)
 		}
-		opts = append(opts, proto.WithTLS(tlsCfg))
+		opts = append(opts, monolink.WithTLS(tlsCfg))
 	}
 
-	client := proto.New("ACHTUNG", *url, opts...)
+	client := monolink.New("ACHTUNG", *url, opts...)
 
 	acht := achtung.NewAchtung(client)
 
-	client.Handle("*", func(req *proto.Request) {
+	client.Handle("*", func(req *monolink.Request) {
 		if req.Msg.To != client.NodeID() {
 			return
 		}

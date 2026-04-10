@@ -1,19 +1,19 @@
 package achtung
 
 import (
-	"achtung/pkg/proto"
 	"fmt"
+	"github.com/MrZloHex/monolink"
 	log "log/slog"
 	"time"
 )
 
 type Achtung struct {
-	client   *proto.Client
+	client   *monolink.Client
 	sched    *Scheduler
 	bootedAt time.Time
 }
 
-func NewAchtung(client *proto.Client) *Achtung {
+func NewAchtung(client *monolink.Client) *Achtung {
 	a := &Achtung{
 		client:   client,
 		sched:    NewScheduler(),
@@ -34,7 +34,7 @@ func (a *Achtung) Shutdown() { a.sched.Shutdown() }
 //	GET  LIST               -> OK LIST [<kind> <name>...]
 //	GET  JOB <name>         -> OK JOB <kind> <name> <rem> <due>
 //	GET  UPTIME             -> OK UPTIME <dur>
-func (a *Achtung) Cmd(req *proto.Request) {
+func (a *Achtung) Cmd(req *monolink.Request) {
 	msg := req.Msg
 	log.Debug("CMD", "from", msg.From, "verb", msg.Verb, "noun", msg.Noun, "args", msg.Args)
 
@@ -56,7 +56,7 @@ func (a *Achtung) Cmd(req *proto.Request) {
 	}
 }
 
-func (a *Achtung) cmdNew(req *proto.Request) {
+func (a *Achtung) cmdNew(req *monolink.Request) {
 	msg := req.Msg
 	switch msg.Noun {
 	case "TIMER":
@@ -113,7 +113,7 @@ func (a *Achtung) cmdNew(req *proto.Request) {
 	}
 }
 
-func (a *Achtung) cmdStop(req *proto.Request) {
+func (a *Achtung) cmdStop(req *monolink.Request) {
 	msg := req.Msg
 	switch msg.Noun {
 	case "TIMER", "ALARM":
@@ -137,7 +137,7 @@ func (a *Achtung) cmdStop(req *proto.Request) {
 	}
 }
 
-func (a *Achtung) cmdGet(req *proto.Request) {
+func (a *Achtung) cmdGet(req *monolink.Request) {
 	msg := req.Msg
 	switch msg.Noun {
 	case "LIST":
