@@ -3,7 +3,7 @@ module achtung
 go 1.24.6
 
 require (
-	github.com/MrZloHex/monolink v0.2.0
+	github.com/MrZloHex/monolink v0.2.1
 	github.com/joho/godotenv v1.5.1
 	github.com/lmittmann/tint v1.1.2
 	github.com/spf13/pflag v1.0.7
