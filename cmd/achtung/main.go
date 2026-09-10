@@ -56,12 +56,14 @@ func main() {
 	defaultCert := os.Getenv("ACHTUNG_TLS_CERT")
 	defaultKey := os.Getenv("ACHTUNG_TLS_KEY")
 	defaultServerCA := os.Getenv("ACHTUNG_TLS_SERVER_CA")
+	defaultJobs := envString("ACHTUNG_JOBS", "jobs.json")
 
 	url := cli.StringP("url", "u", defaultURL, "WebSocket hub URL (env ACHTUNG_HUB_URL; use wss:// with mTLS)")
 	logLevel := cli.StringP("log", "l", defaultLog, "Log level (env ACHTUNG_LOG)")
 	tlsCert := cli.String("tls-cert", defaultCert, "Client certificate PEM for mTLS (env ACHTUNG_TLS_CERT)")
 	tlsKey := cli.String("tls-key", defaultKey, "Client private key PEM for mTLS (env ACHTUNG_TLS_KEY)")
 	tlsServerCA := cli.String("tls-server-ca", defaultServerCA, "Optional PEM CA for hub server cert; empty uses system roots (env ACHTUNG_TLS_SERVER_CA)")
+	jobsPath := cli.StringP("jobs", "j", defaultJobs, "Path to job persistence file; empty disables persistence (env ACHTUNG_JOBS)")
 	cli.Parse()
 
 	log.SetDefault(log.New(tint.NewHandler(os.Stdout, &tint.Options{
@@ -88,7 +90,7 @@ func main() {
 
 	client := monolink.New("ACHTUNG", *url, opts...)
 
-	acht := achtung.NewAchtung(client)
+	acht := achtung.NewAchtung(client, achtung.NewStore(*jobsPath))
 
 	client.Handle("*", func(req *monolink.Request) {
 		if req.Msg.To != client.NodeID() {

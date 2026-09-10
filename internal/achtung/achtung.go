@@ -2,25 +2,76 @@ package achtung
 
 import (
 	"fmt"
-	"github.com/MrZloHex/monolink"
 	log "log/slog"
+	"strings"
 	"time"
+
+	"github.com/MrZloHex/monolink"
 )
 
 type Achtung struct {
 	client   *monolink.Client
 	sched    *Scheduler
+	store    *Store
 	bootedAt time.Time
 }
 
-func NewAchtung(client *monolink.Client) *Achtung {
+// NewAchtung starts the service. A nil store, or one with an empty path,
+// disables persistence: jobs then live only as long as the process, which
+// is the old behaviour.
+func NewAchtung(client *monolink.Client, store *Store) *Achtung {
 	a := &Achtung{
 		client:   client,
 		sched:    NewScheduler(),
+		store:    store,
 		bootedAt: time.Now(),
 	}
+	a.restore()
 	go a.eventLoop()
+	go a.persistLoop()
 	return a
+}
+
+// restore re-adds the jobs saved by a previous run. A corrupt or
+// unreadable file is logged and skipped rather than fatal -- losing the
+// jobs is bad, but refusing to start at all is worse.
+func (a *Achtung) restore() {
+	if a.store == nil || a.store.Path() == "" {
+		return
+	}
+	jobs, err := a.store.Load(time.Now())
+	if err != nil {
+		log.Error("RESTORE FAILED", "path", a.store.Path(), "err", err)
+		return
+	}
+	for _, j := range jobs {
+		if err := a.sched.Add(j); err != nil {
+			log.Error("RESTORE ADD FAILED", "name", j.Name, "err", err)
+			continue
+		}
+		log.Info("RESTORED", "kind", kindStr(j.Kind), "name", j.Name, "due", j.Due.Format(time.DateTime))
+	}
+	if len(jobs) > 0 {
+		log.Info("RESTORED JOBS", "count", len(jobs), "path", a.store.Path())
+	}
+}
+
+// persistLoop writes the job set out after every change. The channel
+// coalesces, so a burst of changes costs one write.
+func (a *Achtung) persistLoop() {
+	if a.store == nil || a.store.Path() == "" {
+		// Still drain, or the scheduler's send would block on a full buffer.
+		for range a.sched.Snapshots() {
+		}
+		return
+	}
+	for jobs := range a.sched.Snapshots() {
+		if err := a.store.Save(jobs); err != nil {
+			log.Error("PERSIST FAILED", "path", a.store.Path(), "err", err)
+			continue
+		}
+		log.Debug("PERSISTED", "count", len(jobs), "path", a.store.Path())
+	}
 }
 
 func (a *Achtung) Shutdown() { a.sched.Shutdown() }
@@ -30,7 +81,9 @@ func (a *Achtung) Shutdown() { a.sched.Shutdown() }
 //	PING PING               -> PONG PONG
 //	NEW  TIMER <name> <dur> -> OK TIMER <name>
 //	NEW  ALARM <name> <d> <t> -> OK ALARM <name>
-//	STOP TIMER|ALARM <name> -> OK <kind> <name>
+//	NEW  EVERY <name> <dur> -> OK EVERY <name>
+//	NEW  DAILY <name> <H.M> -> OK DAILY <name>
+//	STOP TIMER|ALARM|EVERY|DAILY <name> -> OK <kind> <name>
 //	GET  LIST               -> OK LIST [<kind> <name>...]
 //	GET  JOB <name>         -> OK JOB <kind> <name> <rem> <due>
 //	GET  UPTIME             -> OK UPTIME <dur>
@@ -107,6 +160,56 @@ func (a *Achtung) cmdNew(req *monolink.Request) {
 		log.Info("NEW ALARM", "name", name, "due", tm.Format(time.DateTime), "from", msg.From)
 		req.Reply("OK", "ALARM", name)
 
+	case "EVERY":
+		if len(msg.Args) < 2 {
+			req.Reply("ERR", "ARGC")
+			return
+		}
+		name := msg.Args[0]
+		d, err := time.ParseDuration(msg.Args[1])
+		if err != nil || d <= 0 {
+			log.Warn("BAD INTERVAL", "raw", msg.Args[1], "from", msg.From)
+			req.Reply("ERR", "DUR")
+			return
+		}
+		job := Job{
+			Name: name, Kind: KindEvery,
+			Due:      time.Now().Add(d),
+			Interval: d,
+		}
+		if err := a.sched.Add(job); err != nil {
+			log.Error("ADD FAILED", "name", name, "err", err)
+			req.Reply("ERR", "ADD", err.Error())
+			return
+		}
+		log.Info("NEW EVERY", "name", name, "interval", d, "due", job.Due.Format(time.DateTime), "from", msg.From)
+		req.Reply("OK", "EVERY", name)
+
+	case "DAILY":
+		if len(msg.Args) < 2 {
+			req.Reply("ERR", "ARGC")
+			return
+		}
+		name := msg.Args[0]
+		hour, minute, err := parseClockLocal(msg.Args[1])
+		if err != nil {
+			log.Warn("BAD CLOCK", "raw", msg.Args[1], "from", msg.From)
+			req.Reply("ERR", "TIME", msg.Args[1])
+			return
+		}
+		job := Job{
+			Name: name, Kind: KindDaily,
+			AtHour: hour, AtMin: minute,
+			Due: nextDailyAfter(time.Now(), hour, minute),
+		}
+		if err := a.sched.Add(job); err != nil {
+			log.Error("ADD FAILED", "name", name, "err", err)
+			req.Reply("ERR", "ADD", err.Error())
+			return
+		}
+		log.Info("NEW DAILY", "name", name, "at", msg.Args[1], "due", job.Due.Format(time.DateTime), "from", msg.From)
+		req.Reply("OK", "DAILY", name)
+
 	default:
 		log.Warn("UNKNOWN NOUN", "noun", msg.Noun, "from", msg.From)
 		req.Reply("ERR", "NOUN")
@@ -116,7 +219,7 @@ func (a *Achtung) cmdNew(req *monolink.Request) {
 func (a *Achtung) cmdStop(req *monolink.Request) {
 	msg := req.Msg
 	switch msg.Noun {
-	case "TIMER", "ALARM":
+	case "TIMER", "ALARM", "EVERY", "DAILY":
 		if len(msg.Args) < 1 {
 			req.Reply("ERR", "ARGC")
 			return
@@ -196,17 +299,20 @@ func (a *Achtung) eventLoop() {
 	}
 }
 
-func kindStr(k JobKind) string {
-	switch k {
-	case KindTimer:
-		return "TIMER"
-	case KindAlarm:
-		return "ALARM"
-	case KindEvery:
-		return "EVERY"
-	default:
-		return "UNK"
+func kindStr(k JobKind) string { return k.String() }
+
+// parseClockLocal reads a wire clock time. The wire has no colons inside
+// a field, so "H.M" is the canonical form; "H:M" is accepted too for
+// anything typed by hand.
+func parseClockLocal(s string) (hour, minute int, err error) {
+	norm := strings.ReplaceAll(s, ":", ".")
+	if _, err = fmt.Sscanf(norm, "%d.%d", &hour, &minute); err != nil {
+		return 0, 0, err
 	}
+	if hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return 0, 0, fmt.Errorf("clock out of range: %q", s)
+	}
+	return hour, minute, nil
 }
 
 func parseTimeLocal(d, t string) (time.Time, error) {
@@ -222,6 +328,13 @@ func parseTimeLocal(d, t string) (time.Time, error) {
 	return time.Date(year, time.Month(month), day, hour, minute, 0, 0, time.Local), nil
 }
 
+// serializeTimeLocal renders a due time as a single wire token. It has to
+// be one field: OK:JOB is specified as
+// OK:JOB:<kind>:<name>:<remaining>:<due>, and a colon here would split the
+// due into two, pushing FROM out of position for every reader.
+// Zero-padded so a reader can use one fixed layout ("2006.01.02.15.04")
+// instead of guessing at field widths.
 func serializeTimeLocal(t time.Time) string {
-	return fmt.Sprintf("%d.%d.%d:%d.%d", t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute())
+	return fmt.Sprintf("%04d.%02d.%02d.%02d.%02d",
+		t.Year(), int(t.Month()), t.Day(), t.Hour(), t.Minute())
 }

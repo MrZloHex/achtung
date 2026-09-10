@@ -46,6 +46,11 @@ type shutdownReq struct {
 type Scheduler struct {
 	events chan Event
 
+	// snapshots carries the full job set after every mutation, for
+	// persistence. Buffered depth 1 and coalescing: a consumer that falls
+	// behind simply skips to the newest state, which is all it needs.
+	snapshots chan []Job
+
 	// requests:
 	add      chan addReq
 	del      chan delReq
@@ -64,15 +69,16 @@ type Scheduler struct {
 
 func NewScheduler() *Scheduler {
 	s := &Scheduler{
-		events:   make(chan Event, 64),
-		add:      make(chan addReq),
-		del:      make(chan delReq),
-		get:      make(chan getReq),
-		list:     make(chan listReq),
-		pause:    make(chan pauseReq),
-		resume:   make(chan resumeReq),
-		shutdown: make(chan shutdownReq),
-		idx:      make(map[string]*jitem),
+		events:    make(chan Event, 64),
+		snapshots: make(chan []Job, 1),
+		add:       make(chan addReq),
+		del:       make(chan delReq),
+		get:       make(chan getReq),
+		list:      make(chan listReq),
+		pause:     make(chan pauseReq),
+		resume:    make(chan resumeReq),
+		shutdown:  make(chan shutdownReq),
+		idx:       make(map[string]*jitem),
 	}
 	heap.Init(&s.h)
 	go s.loop()
@@ -80,6 +86,25 @@ func NewScheduler() *Scheduler {
 }
 
 func (s *Scheduler) Events() <-chan Event { return s.events }
+
+// Snapshots yields the job set after each change. See the field comment
+// for the coalescing behaviour.
+func (s *Scheduler) Snapshots() <-chan []Job { return s.snapshots }
+
+// notifyChanged publishes the current job set. Only the loop goroutine
+// calls this, so draining then sending cannot block: we are the sole
+// sender and have just made room.
+func (s *Scheduler) notifyChanged() {
+	snap := make([]Job, 0, len(s.idx))
+	for _, it := range s.idx {
+		snap = append(snap, it.job)
+	}
+	select {
+	case <-s.snapshots:
+	default:
+	}
+	s.snapshots <- snap
+}
 
 func (s *Scheduler) Add(job Job) error {
 	r := addReq{job: job, resp: make(chan error, 1)}
@@ -153,10 +178,16 @@ func (s *Scheduler) loop() {
 		select {
 		case r := <-s.add:
 			err := s.addJob(r.job)
+			if err == nil {
+				s.notifyChanged()
+			}
 			r.resp <- err
 
 		case r := <-s.del:
 			ok := s.deleteJob(r.name)
+			if ok {
+				s.notifyChanged()
+			}
 			r.resp <- ok
 
 		case r := <-s.get:
@@ -181,10 +212,16 @@ func (s *Scheduler) loop() {
 
 		case r := <-s.pause:
 			ok := s.pauseJob(r.name)
+			if ok {
+				s.notifyChanged()
+			}
 			r.resp <- ok
 
 		case r := <-s.resume:
 			ok := s.resumeJob(r.name)
+			if ok {
+				s.notifyChanged()
+			}
 			r.resp <- ok
 
 		case <-timerC:
@@ -195,6 +232,7 @@ func (s *Scheduler) loop() {
 				s.t.Stop()
 			}
 			close(s.events)
+			close(s.snapshots)
 			r.done <- struct{}{}
 			return
 		}
@@ -211,6 +249,14 @@ func (s *Scheduler) addJob(j Job) error {
 		delete(s.idx, j.Name)
 	}
 	j.Active = true
+	// A repeating job handed to us with a stale Due (from disk, or from a
+	// caller that computed it loosely) is pulled forward before it enters
+	// the heap, so it cannot fire immediately on add.
+	if j.Repeating() {
+		if next, ok := j.NextAfter(time.Now()); ok {
+			j.Due = next
+		}
+	}
 	it := &jitem{job: j}
 	heap.Push(&s.h, it)
 	s.idx[j.Name] = it
@@ -284,6 +330,7 @@ func (s *Scheduler) armTimer() {
 
 func (s *Scheduler) onTick() {
 	now := time.Now()
+	fired := false
 	var paused []*jitem
 	for s.h.Len() > 0 {
 		top := s.h[0]
@@ -307,8 +354,12 @@ func (s *Scheduler) onTick() {
 		default:
 		}
 
-		if j.Kind == KindEvery {
-			j.Due = j.Due.Add(j.Interval)
+		// Re-arm repeating jobs to their next occurrence strictly after
+		// `now`. NextAfter jumps the whole gap in one step, so a job whose
+		// Due went stale during an outage fires once here and then lands in
+		// the future -- it does not spin, firing once per interval missed.
+		if next, ok := j.NextAfter(now); ok {
+			j.Due = next
 			top.job = j
 			heap.Push(&s.h, top)
 			s.idx[j.Name] = top
@@ -316,9 +367,14 @@ func (s *Scheduler) onTick() {
 			top.job.Active = false
 			delete(s.idx, j.Name)
 		}
+		fired = true
 	}
 
 	for _, p := range paused {
 		heap.Push(&s.h, p)
+	}
+
+	if fired {
+		s.notifyChanged()
 	}
 }

@@ -74,6 +74,7 @@
   ▪ `ACHTUNG_TLS_CERT` — client certificate PEM (mTLS)
   ▪ `ACHTUNG_TLS_KEY` — client private key PEM (mTLS)
   ▪ `ACHTUNG_TLS_SERVER_CA` — optional PEM CA for the hub server cert; omit for system trust store
+  ▪ `ACHTUNG_JOBS` — job persistence file (default `jobs.json`); empty disables persistence
 
   With mTLS, the URL must be **`wss://`** and both **`ACHTUNG_TLS_CERT`** and **`ACHTUNG_TLS_KEY`** must be set (or equivalent `--tls-cert` / `--tls-key`).
 
@@ -83,6 +84,12 @@
   ▪ `--tls-cert` — client certificate PEM (`ACHTUNG_TLS_CERT`)
   ▪ `--tls-key` — client private key PEM (`ACHTUNG_TLS_KEY`)
   ▪ `--tls-server-ca` — optional hub server CA PEM (`ACHTUNG_TLS_SERVER_CA`)
+  ▪ `-j`, `--jobs` — job persistence file (`ACHTUNG_JOBS`)
+
+  **Persistence.** Jobs are written to `ACHTUNG_JOBS` after every change and
+  reloaded on boot, so a restart no longer loses them silently. One-shot
+  jobs whose time passed while the process was down are dropped rather than
+  fired at startup; repeating jobs are advanced to their next occurrence.
 
   ───────────────────────────────────────────────────────────────
   ▓ PROTOCOL
@@ -99,6 +106,15 @@
 
   `ACHTUNG:NEW:ALARM:<name>:<date>:<time>:<from>` → `<from>:OK:ALARM:<name>:ACHTUNG`
   `<date>` — `Y.M.D` (e.g. `2026.4.9`). `<time>` — `H.M` in local time (e.g. `14.30`).
+
+  `ACHTUNG:NEW:EVERY:<name>:<duration>:<from>` → `<from>:OK:EVERY:<name>:ACHTUNG`
+  Repeats on an interval.
+
+  `ACHTUNG:NEW:DAILY:<name>:<time>:<from>` → `<from>:OK:DAILY:<name>:ACHTUNG`
+  Repeats at a local wall-clock `H.M`, so it stays put across DST.
+
+  Both repeating kinds skip occurrences missed while achtung was down
+  rather than replaying them.
 
   ─── STOP ───
   `ACHTUNG:STOP:TIMER:<name>:<from>` / `ACHTUNG:STOP:ALARM:<name>:<from>`
