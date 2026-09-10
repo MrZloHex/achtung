@@ -78,7 +78,7 @@ func (a *Achtung) Shutdown() { a.sched.Shutdown() }
 
 // Cmd dispatches an incoming request by verb.
 //
-//	PING PING               -> PONG PONG
+//	PING PING               -> PONG PONG (v1) | OK PING (v2)
 //	NEW  TIMER <name> <dur> -> OK TIMER <name>
 //	NEW  ALARM <name> <d> <t> -> OK ALARM <name>
 //	NEW  EVERY <name> <dur> -> OK EVERY <name>
@@ -96,7 +96,12 @@ func (a *Achtung) Cmd(req *monolink.Request) {
 		log.Debug("IGNORE", "verb", msg.Verb, "noun", msg.Noun, "from", msg.From)
 		return
 	case "PING":
-		req.Reply("PONG", "PONG")
+		// v2 answers OK:PING, correlated by id like any reply (SPEC §43).
+		if msg.Version == monolink.V2 {
+			req.Reply("OK", "PING")
+		} else {
+			req.Reply("PONG", "PONG")
+		}
 	case "NEW":
 		a.cmdNew(req)
 	case "STOP":
