@@ -3,6 +3,7 @@ package achtung
 import (
 	"fmt"
 	log "log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +15,8 @@ type Achtung struct {
 	sched    *Scheduler
 	store    *Store
 	bootedAt time.Time
+
+	jobsCount, next *monolink.Property // what achtung owes the bus, SPEC §27
 }
 
 // NewAchtung starts the service. A nil store, or one with an empty path,
@@ -26,6 +29,7 @@ func NewAchtung(client *monolink.Client, store *Store) *Achtung {
 		store:    store,
 		bootedAt: time.Now(),
 	}
+	a.register()
 	a.restore()
 	go a.eventLoop()
 	go a.persistLoop()
@@ -56,16 +60,54 @@ func (a *Achtung) restore() {
 	}
 }
 
-// persistLoop writes the job set out after every change. The channel
-// coalesces, so a burst of changes costs one write.
-func (a *Achtung) persistLoop() {
-	if a.store == nil || a.store.Path() == "" {
-		// Still drain, or the scheduler's send would block on a full buffer.
-		for range a.sched.Snapshots() {
-		}
+// register describes achtung to the bus: REG on every connect, then a PUB
+// whenever a property moves. Before the first Connect, so that connect
+// announces it.
+func (a *Achtung) register() {
+	node := monolink.NewNode(a.client, monolink.NodeInfo{
+		Class: monolink.ClassNode, Product: "achtung", Version: monolink.BuildVersion(),
+	})
+	a.jobsCount = node.Prop("JOBS.COUNT", monolink.Int(0, 100000), "jobs armed")
+	a.next = node.Prop("NEXT", monolink.Time(), "when the next job fires; empty when none is")
+	a.announce(nil)
+}
+
+// announce sets what achtung owes from a job set: how many are armed, and
+// when the soonest fires. A paused job is not armed.
+func (a *Achtung) announce(jobs []Job) {
+	if a.jobsCount == nil {
 		return
 	}
+	armed := 0
+	var next time.Time
+	for _, j := range jobs {
+		if j.Paused {
+			continue
+		}
+		armed++
+		if next.IsZero() || j.Due.Before(next) {
+			next = j.Due
+		}
+	}
+	a.jobsCount.Set(strconv.Itoa(armed))
+	if next.IsZero() {
+		a.next.Set("")
+	} else {
+		a.next.Set(next.Format(time.RFC3339))
+	}
+}
+
+// persistLoop follows every change to the job set: it announces it, and
+// writes it out. The channel coalesces, so a burst of changes costs one
+// write — and it is the only reader, so even with persistence disabled it
+// must drain, or the scheduler's send would block on a full buffer.
+func (a *Achtung) persistLoop() {
+	persist := a.store != nil && a.store.Path() != ""
 	for jobs := range a.sched.Snapshots() {
+		a.announce(jobs)
+		if !persist {
+			continue
+		}
 		if err := a.store.Save(jobs); err != nil {
 			log.Error("PERSIST FAILED", "path", a.store.Path(), "err", err)
 			continue
