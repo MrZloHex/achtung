@@ -11,7 +11,7 @@ import (
 // would keep popping the same job while its due time was still in the
 // past, emitting a fire for every interval in the gap.
 func TestSchedulerStaleRepeatingJobDoesNotBurst(t *testing.T) {
-	s := NewScheduler()
+	s := NewScheduler(nil)
 	defer s.Shutdown()
 
 	const interval = 40 * time.Millisecond
@@ -55,7 +55,7 @@ func TestSchedulerStaleRepeatingJobDoesNotBurst(t *testing.T) {
 // A restored daily job must not fire the moment it is added just because
 // its stored Due is in the past.
 func TestSchedulerStaleDailyDoesNotFireOnAdd(t *testing.T) {
-	s := NewScheduler()
+	s := NewScheduler(nil)
 	defer s.Shutdown()
 
 	now := time.Now()
@@ -91,7 +91,7 @@ func TestSchedulerStaleDailyDoesNotFireOnAdd(t *testing.T) {
 
 // Every mutation should publish a snapshot, so the persister can write it.
 func TestSchedulerPublishesSnapshots(t *testing.T) {
-	s := NewScheduler()
+	s := NewScheduler(nil)
 	defer s.Shutdown()
 
 	if err := s.Add(Job{Name: "a", Kind: KindAlarm, Due: time.Now().Add(time.Hour)}); err != nil {
@@ -124,7 +124,7 @@ func TestSchedulerPublishesSnapshots(t *testing.T) {
 // coalescing buffer is what prevents a stalled persister from wedging the
 // whole service.
 func TestSchedulerSurvivesUndrainedSnapshots(t *testing.T) {
-	s := NewScheduler()
+	s := NewScheduler(nil)
 	defer s.Shutdown()
 
 	for i := 0; i < 50; i++ {

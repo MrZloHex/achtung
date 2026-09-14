@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +17,10 @@ import (
 	"achtung/internal/achtung"
 	"github.com/MrZloHex/monolink"
 )
+
+// inboxSize is how many requests may wait for achtung, which takes them one
+// at a time, in order.
+const inboxSize = 1024
 
 var logLevelMap = map[string]log.Level{
 	"debug": log.LevelDebug,
@@ -51,53 +54,49 @@ func envString(key, fallback string) string {
 func main() {
 	loadDotEnv()
 
-	defaultURL := envString("ACHTUNG_HUB_URL", "ws://localhost:8092")
+	defaultURL := envString("ACHTUNG_HUB_URL", "wss://127.0.0.1:8443")
 	defaultLog := envString("ACHTUNG_LOG", "info")
 	defaultCert := os.Getenv("ACHTUNG_TLS_CERT")
 	defaultKey := os.Getenv("ACHTUNG_TLS_KEY")
 	defaultServerCA := os.Getenv("ACHTUNG_TLS_SERVER_CA")
-	defaultJobs := envString("ACHTUNG_JOBS", "jobs.json")
+	// Set and empty means what it says: no persistence.
+	defaultJobs := "jobs.json"
+	if v, ok := os.LookupEnv("ACHTUNG_JOBS"); ok {
+		defaultJobs = v
+	}
 
-	url := cli.StringP("url", "u", defaultURL, "WebSocket hub URL (env ACHTUNG_HUB_URL; use wss:// with mTLS)")
+	url := cli.StringP("url", "u", defaultURL, "Hub URL, wss:// only (env ACHTUNG_HUB_URL)")
 	logLevel := cli.StringP("log", "l", defaultLog, "Log level (env ACHTUNG_LOG)")
 	tlsCert := cli.String("tls-cert", defaultCert, "Client certificate PEM for mTLS (env ACHTUNG_TLS_CERT)")
 	tlsKey := cli.String("tls-key", defaultKey, "Client private key PEM for mTLS (env ACHTUNG_TLS_KEY)")
-	tlsServerCA := cli.String("tls-server-ca", defaultServerCA, "Optional PEM CA for hub server cert; empty uses system roots (env ACHTUNG_TLS_SERVER_CA)")
+	tlsServerCA := cli.String("tls-server-ca", defaultServerCA, "The bubble CA's PEM, which vouches for the hub (env ACHTUNG_TLS_SERVER_CA)")
 	jobsPath := cli.StringP("jobs", "j", defaultJobs, "Path to job persistence file; empty disables persistence (env ACHTUNG_JOBS)")
 	cli.Parse()
 
-	log.SetDefault(log.New(tint.NewHandler(os.Stdout, &tint.Options{
-		Level: logLevelMap[*logLevel],
-	})))
-
-	opts := []monolink.Option{monolink.WithReconnect(5 * time.Second)}
-	if *tlsCert != "" || *tlsKey != "" || *tlsServerCA != "" {
-		if *tlsCert == "" || *tlsKey == "" {
-			log.Error("mTLS requires both --tls-cert and --tls-key (or ACHTUNG_TLS_CERT and ACHTUNG_TLS_KEY)")
-			os.Exit(1)
-		}
-		if !strings.HasPrefix(*url, "wss://") {
-			log.Error("mTLS requires a wss:// hub URL", "url", *url)
-			os.Exit(1)
-		}
-		tlsCfg, err := monolink.LoadClientTLS(*tlsCert, *tlsKey, *tlsServerCA)
-		if err != nil {
-			log.Error("TLS client configuration failed", "err", err)
-			os.Exit(1)
-		}
-		opts = append(opts, monolink.WithTLS(tlsCfg))
+	level, ok := logLevelMap[*logLevel]
+	if !ok {
+		_, _ = os.Stderr.WriteString("achtung: log level " + *logLevel + ": debug, info, warn or error\n")
+		os.Exit(2)
 	}
+	log.SetDefault(log.New(tint.NewHandler(os.Stdout, &tint.Options{Level: level})))
 
-	client := monolink.New("ACHTUNG", *url, opts...)
+	// v2 alone: the enforcing hub carries nothing else (SPEC §44).
+	tlsCfg, err := monolink.SecureTLS(*url, *tlsCert, *tlsKey, *tlsServerCA)
+	if err != nil {
+		log.Error("cannot reach the hub safely", "err", err)
+		os.Exit(1)
+	}
+	opts := []monolink.Option{monolink.WithReconnect(5 * time.Second), monolink.WithDialect(monolink.V2),
+		monolink.WithTLS(tlsCfg), monolink.WithInbox(inboxSize)}
 
-	acht := achtung.NewAchtung(client, achtung.NewStore(*jobsPath))
+	client := monolink.New(achtung.NodeName, *url, opts...)
 
-	client.Handle("*", func(req *monolink.Request) {
-		if req.Msg.To != client.NodeID() {
-			return
-		}
-		acht.Cmd(req)
-	})
+	acht, err := achtung.NewAchtung(client, achtung.NewStore(*jobsPath))
+	if err != nil {
+		log.Error("cannot restore the jobs", "err", err)
+		os.Exit(1)
+	}
+	go acht.Serve(client.Inbox())
 
 	log.Info("BOOTING UP", "url", *url)
 
@@ -111,6 +110,6 @@ func main() {
 	<-sig
 
 	log.Info("SHUTTING DOWN")
-	acht.Shutdown()
+	acht.Shutdown() // every change answered is saved; nothing fires after
 	client.Close()
 }

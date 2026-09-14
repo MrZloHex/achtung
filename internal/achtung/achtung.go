@@ -1,15 +1,36 @@
 package achtung
 
 import (
+	"errors"
 	"fmt"
 	log "log/slog"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MrZloHex/monolink"
 )
 
+// NodeName is achtung's address on the bus.
+const NodeName = "ACHTUNG"
+
+const (
+	// lateFire is how long after firing a job is still worth telling the
+	// bus and the buzzer: a hub restarting is waited out, but an alarm an
+	// hour late is a different alarm.
+	lateFire   = 10 * time.Minute
+	retryEvery = 2 * time.Second
+	// listPage is how many jobs one LIST reply carries: a kind and a name
+	// each, sixteen arguments to a frame (SPEC §15).
+	listPage = 8
+)
+
+// Achtung serves whoever the hub lets through: the hub holds every panel to
+// its person's grants (ACHTUNG.NEW.*, ACHTUNG.STOP.*, ACHTUNG.GET.*) and
+// every node to its policy line (SECURITY.txt §5). Jobs belong to the
+// household, not to whoever made them.
 type Achtung struct {
 	client   *monolink.Client
 	sched    *Scheduler
@@ -17,47 +38,50 @@ type Achtung struct {
 	bootedAt time.Time
 
 	jobsCount, next *monolink.Property // what achtung owes the bus, SPEC §27
+
+	buzzMu   sync.Mutex
+	silenced time.Time // the last STOP: no job fired before it sounds the buzzer
+
+	stop     chan struct{}
+	wg       sync.WaitGroup
+	stopOnce sync.Once
 }
 
-// NewAchtung starts the service. A nil store, or one with an empty path,
-// disables persistence: jobs then live only as long as the process, which
-// is the old behaviour.
-func NewAchtung(client *monolink.Client, store *Store) *Achtung {
+// NewAchtung restores the saved jobs and starts the service. A nil store,
+// or one with an empty path, keeps jobs only as long as the process.
+//
+// A saved file that cannot be read, or is not right, stops achtung with the
+// file untouched: carrying on without it, the next change would write over
+// it with whatever was left.
+func NewAchtung(client *monolink.Client, store *Store) (*Achtung, error) {
+	var jobs []Job
+	var persist func([]Job) error
+	if store != nil && store.Path() != "" {
+		var err error
+		if jobs, err = store.Load(time.Now()); err != nil {
+			return nil, err
+		}
+		persist = store.Save
+	}
 	a := &Achtung{
 		client:   client,
-		sched:    NewScheduler(),
+		sched:    NewScheduler(persist),
 		store:    store,
 		bootedAt: time.Now(),
+		stop:     make(chan struct{}),
 	}
 	a.register()
-	a.restore()
-	go a.eventLoop()
-	go a.persistLoop()
-	return a
-}
-
-// restore re-adds the jobs saved by a previous run. A corrupt or
-// unreadable file is logged and skipped rather than fatal -- losing the
-// jobs is bad, but refusing to start at all is worse.
-func (a *Achtung) restore() {
-	if a.store == nil || a.store.Path() == "" {
-		return
-	}
-	jobs, err := a.store.Load(time.Now())
-	if err != nil {
-		log.Error("RESTORE FAILED", "path", a.store.Path(), "err", err)
-		return
-	}
 	for _, j := range jobs {
 		if err := a.sched.Add(j); err != nil {
-			log.Error("RESTORE ADD FAILED", "name", j.Name, "err", err)
-			continue
+			a.sched.Shutdown()
+			return nil, fmt.Errorf("restore %q: %w", j.Name, err)
 		}
-		log.Info("RESTORED", "kind", kindStr(j.Kind), "name", j.Name, "due", j.Due.Format(time.DateTime))
+		log.Info("RESTORED", "kind", j.Kind, "name", j.Name, "due", j.Due.Format(time.DateTime))
 	}
-	if len(jobs) > 0 {
-		log.Info("RESTORED JOBS", "count", len(jobs), "path", a.store.Path())
-	}
+	a.wg.Add(2)
+	go a.eventLoop()
+	go a.announceLoop()
+	return a, nil
 }
 
 // register describes achtung to the bus: REG on every connect, then a PUB
@@ -67,7 +91,7 @@ func (a *Achtung) register() {
 	node := monolink.NewNode(a.client, monolink.NodeInfo{
 		Class: monolink.ClassNode, Product: "achtung", Version: monolink.BuildVersion(),
 	})
-	a.jobsCount = node.Prop("JOBS.COUNT", monolink.Int(0, 100000), "jobs armed")
+	a.jobsCount = node.Prop("JOBS.COUNT", monolink.Int(0, maxJobs), "jobs armed")
 	a.next = node.Prop("NEXT", monolink.Time(), "when the next job fires; empty when none is")
 	a.announce(nil)
 }
@@ -97,282 +121,339 @@ func (a *Achtung) announce(jobs []Job) {
 	}
 }
 
-// persistLoop follows every change to the job set: it announces it, and
-// writes it out. The channel coalesces, so a burst of changes costs one
-// write — and it is the only reader, so even with persistence disabled it
-// must drain, or the scheduler's send would block on a full buffer.
-func (a *Achtung) persistLoop() {
-	persist := a.store != nil && a.store.Path() != ""
+// announceLoop follows every change to the job set, off the scheduler's
+// goroutine: announcing is the bus's business, and may wait on it.
+func (a *Achtung) announceLoop() {
+	defer a.wg.Done()
 	for jobs := range a.sched.Snapshots() {
 		a.announce(jobs)
-		if !persist {
-			continue
-		}
-		if err := a.store.Save(jobs); err != nil {
-			log.Error("PERSIST FAILED", "path", a.store.Path(), "err", err)
-			continue
-		}
-		log.Debug("PERSISTED", "count", len(jobs), "path", a.store.Path())
 	}
 }
 
-func (a *Achtung) Shutdown() { a.sched.Shutdown() }
+// Shutdown stops firing and taking changes — every change answered is
+// saved already — stops waiting on the bus for fires it has not taken,
+// and waits for both loops. Close the client after. Twice is harmless.
+func (a *Achtung) Shutdown() {
+	a.stopOnce.Do(func() {
+		close(a.stop)
+		a.sched.Shutdown()
+		a.wg.Wait()
+	})
+}
 
-// Cmd dispatches an incoming request by verb.
+// Serve answers requests from inbox — the client's — one at a time, in the
+// order they arrived: monolink runs each handler on its own goroutine, and
+// a NEW then a STOP must not be done the other way round. It returns when
+// the inbox closes, with the client.
+func (a *Achtung) Serve(inbox <-chan monolink.Message) {
+	for m := range inbox {
+		a.Cmd(m)
+	}
+}
+
+// Cmd answers one request. Arguments are never logged whole.
 //
-//	PING PING               -> PONG PONG (v1) | OK PING (v2)
-//	NEW  TIMER <name> <dur> -> OK TIMER <name>
-//	NEW  ALARM <name> <d> <t> -> OK ALARM <name>
-//	NEW  EVERY <name> <dur> -> OK EVERY <name>
-//	NEW  DAILY <name> <H.M> -> OK DAILY <name>
+//	NEW  TIMER <name> <dur>      -> OK TIMER <name>
+//	NEW  ALARM <name> <d> <t>    -> OK ALARM <name>
+//	NEW  EVERY <name> <dur>      -> OK EVERY <name>
+//	NEW  DAILY <name> <H.M>      -> OK DAILY <name>
 //	STOP TIMER|ALARM|EVERY|DAILY <name> -> OK <kind> <name>
-//	GET  LIST               -> OK LIST [<kind> <name>...]
-//	GET  JOB <name>         -> OK JOB <kind> <name> <rem> <due>
-//	GET  UPTIME             -> OK UPTIME <dur>
-func (a *Achtung) Cmd(req *monolink.Request) {
-	msg := req.Msg
-	log.Debug("CMD", "from", msg.From, "verb", msg.Verb, "noun", msg.Noun, "args", msg.Args)
-
-	switch msg.Verb {
-	case "OK", "ERR", "PONG":
-		log.Debug("IGNORE", "verb", msg.Verb, "noun", msg.Noun, "from", msg.From)
+//	GET  LIST [<after>]          -> OK LIST [<kind> <name>...]  by name; empty past the last
+//	GET  JOB <name>              -> OK JOB <kind> <name> <rem> <due>
+//
+// PING, UPTIME, VERSION, JOBS.COUNT, NEXT and the roll call are the object
+// model's (monolink.Node).
+func (a *Achtung) Cmd(m monolink.Message) {
+	if m.Version != monolink.V2 {
+		return // the hub carries v2 alone
+	}
+	to, err := monolink.ParseAddress(m.To)
+	if err != nil || to.Node != NodeName || to.Bubble != "" || answeredElsewhere(m) {
 		return
-	case "PING":
-		// v2 answers OK:PING, correlated by id like any reply (SPEC §43).
-		if msg.Version == monolink.V2 {
-			req.Reply("OK", "PING")
-		} else {
-			req.Reply("PONG", "PONG")
-		}
-	case "NEW":
-		a.cmdNew(req)
-	case "STOP":
-		a.cmdStop(req)
-	case "GET":
-		a.cmdGet(req)
+	}
+	log.Debug("CMD", "from", m.From, "verb", m.Verb, "noun", m.Noun)
+	var (
+		noun string
+		args []string
+	)
+	switch m.Verb {
+	case monolink.VerbNew:
+		noun, args, err = a.cmdNew(m)
+	case monolink.VerbStop:
+		noun, args, err = a.cmdStop(m)
+	case monolink.VerbGet:
+		noun, args, err = a.cmdGet(m)
 	default:
-		log.Warn("UNKNOWN VERB", "verb", msg.Verb, "from", msg.From)
-		req.Reply("ERR", "VERB")
+		err = monolink.Fail(monolink.CodeVerb, "achtung takes NEW, STOP and GET")
+	}
+	if err != nil {
+		a.fail(m, err)
+		return
+	}
+	a.reply(m, monolink.VerbOK, noun, args...)
+}
+
+// answeredElsewhere is whether m is not achtung's to answer: the object
+// model answers PING, the roll call and achtung's properties, and nobody
+// answers a reply or an announcement (§18).
+func answeredElsewhere(m monolink.Message) bool {
+	switch m.Verb {
+	case monolink.VerbOK, monolink.VerbErr, monolink.VerbPong, monolink.VerbPub, monolink.VerbReg, monolink.VerbFire, monolink.VerbPing:
+		return true
+	case monolink.VerbGet, monolink.VerbSet:
+		switch m.Noun {
+		case monolink.VerbReg, "JOBS.COUNT", "NEXT", "UPTIME", "VERSION":
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Achtung) reply(m monolink.Message, verb, noun string, args ...string) {
+	err := a.client.SendMessage(monolink.Message{Version: monolink.V2, ID: m.ID, From: a.client.Address(),
+		To: m.From, Verb: verb, Noun: noun, Args: args})
+	if err != nil {
+		log.Warn("REPLY NOT SENT", "to", m.From, "noun", noun, "err", err)
 	}
 }
 
-func (a *Achtung) cmdNew(req *monolink.Request) {
-	msg := req.Msg
-	switch msg.Noun {
-	case "TIMER":
-		if len(msg.Args) < 2 {
-			req.Reply("ERR", "ARGC")
-			return
-		}
-		name := msg.Args[0]
-		d, err := time.ParseDuration(msg.Args[1])
-		if err != nil {
-			log.Warn("BAD DURATION", "raw", msg.Args[1], "from", msg.From)
-			req.Reply("ERR", "DUR")
-			return
-		}
-		job := Job{
-			Name: name, Kind: KindTimer,
-			Due: time.Now().Add(d),
-		}
-		if err := a.sched.Add(job); err != nil {
-			log.Error("ADD FAILED", "name", name, "err", err)
-			req.Reply("ERR", "ADD", err.Error())
-			return
-		}
-		log.Info("NEW TIMER", "name", name, "duration", d, "due", job.Due.Format(time.DateTime), "from", msg.From)
-		req.Reply("OK", "TIMER", name)
-
-	case "ALARM":
-		if len(msg.Args) < 3 {
-			req.Reply("ERR", "ARGC")
-			return
-		}
-		name := msg.Args[0]
-		tm, err := parseTimeLocal(msg.Args[1], msg.Args[2])
-		if err != nil {
-			log.Warn("BAD TIME", "date", msg.Args[1], "time", msg.Args[2], "from", msg.From)
-			req.Reply("ERR", "TIME", msg.Args[1], msg.Args[2])
-			return
-		}
-		job := Job{
-			Name: name, Kind: KindAlarm,
-			Due: tm,
-		}
-		if err := a.sched.Add(job); err != nil {
-			log.Error("ADD FAILED", "name", name, "err", err)
-			req.Reply("ERR", "ADD", err.Error())
-			return
-		}
-		log.Info("NEW ALARM", "name", name, "due", tm.Format(time.DateTime), "from", msg.From)
-		req.Reply("OK", "ALARM", name)
-
-	case "EVERY":
-		if len(msg.Args) < 2 {
-			req.Reply("ERR", "ARGC")
-			return
-		}
-		name := msg.Args[0]
-		d, err := time.ParseDuration(msg.Args[1])
-		if err != nil || d <= 0 {
-			log.Warn("BAD INTERVAL", "raw", msg.Args[1], "from", msg.From)
-			req.Reply("ERR", "DUR")
-			return
-		}
-		job := Job{
-			Name: name, Kind: KindEvery,
-			Due:      time.Now().Add(d),
-			Interval: d,
-		}
-		if err := a.sched.Add(job); err != nil {
-			log.Error("ADD FAILED", "name", name, "err", err)
-			req.Reply("ERR", "ADD", err.Error())
-			return
-		}
-		log.Info("NEW EVERY", "name", name, "interval", d, "due", job.Due.Format(time.DateTime), "from", msg.From)
-		req.Reply("OK", "EVERY", name)
-
-	case "DAILY":
-		if len(msg.Args) < 2 {
-			req.Reply("ERR", "ARGC")
-			return
-		}
-		name := msg.Args[0]
-		hour, minute, err := parseClockLocal(msg.Args[1])
-		if err != nil {
-			log.Warn("BAD CLOCK", "raw", msg.Args[1], "from", msg.From)
-			req.Reply("ERR", "TIME", msg.Args[1])
-			return
-		}
-		job := Job{
-			Name: name, Kind: KindDaily,
-			AtHour: hour, AtMin: minute,
-			Due: nextDailyAfter(time.Now(), hour, minute),
-		}
-		if err := a.sched.Add(job); err != nil {
-			log.Error("ADD FAILED", "name", name, "err", err)
-			req.Reply("ERR", "ADD", err.Error())
-			return
-		}
-		log.Info("NEW DAILY", "name", name, "at", msg.Args[1], "due", job.Due.Format(time.DateTime), "from", msg.From)
-		req.Reply("OK", "DAILY", name)
-
+// fail answers err: achtung's own refusal as it is, and a failed save as
+// no more than that — where the file is stays in the log.
+func (a *Achtung) fail(m monolink.Message, err error) {
+	var re *monolink.ReplyError
+	switch {
+	case errors.As(err, &re) && re.Detail != "":
+		a.reply(m, monolink.VerbErr, re.Code, re.Detail)
+	case errors.As(err, &re):
+		a.reply(m, monolink.VerbErr, re.Code)
+	case errors.Is(err, errNoJob):
+		a.reply(m, monolink.VerbErr, monolink.CodeNAC)
+	case errors.Is(err, errWrongKind):
+		a.reply(m, monolink.VerbErr, monolink.CodeNAC, err.Error())
+	case errors.Is(err, errInvalid):
+		a.reply(m, monolink.VerbErr, monolink.CodeArg, err.Error())
+	case errors.Is(err, errFull), errors.Is(err, errClosed):
+		a.reply(m, monolink.VerbErr, monolink.CodeBusy, err.Error())
 	default:
-		log.Warn("UNKNOWN NOUN", "noun", msg.Noun, "from", msg.From)
-		req.Reply("ERR", "NOUN")
+		log.Error("SAVE FAILED", "verb", m.Verb, "noun", m.Noun, "err", err)
+		a.reply(m, monolink.VerbErr, monolink.CodeState, "could not save")
 	}
 }
 
-func (a *Achtung) cmdStop(req *monolink.Request) {
-	msg := req.Msg
-	switch msg.Noun {
-	case "TIMER", "ALARM", "EVERY", "DAILY":
-		if len(msg.Args) < 1 {
-			req.Reply("ERR", "ARGC")
-			return
-		}
-		name := msg.Args[0]
-		ok := a.sched.Delete(name)
-		if !ok {
-			log.Warn("STOP NOT FOUND", "kind", msg.Noun, "name", name, "from", msg.From)
-		} else {
-			log.Info("STOP", "kind", msg.Noun, "name", name, "from", msg.From)
-		}
-		a.client.Send("VERTEX", "OFF", "BUZZ")
-		req.Reply("OK", msg.Noun, name)
-
-	default:
-		log.Warn("UNKNOWN NOUN", "noun", msg.Noun, "from", msg.From)
-		req.Reply("ERR", "NOUN")
+// jobFrom reads NEW:<kind>'s arguments into a job, as of now:
+//
+//	TIMER <name> <duration>    a Go duration, a second to a year
+//	ALARM <name> <date> <time> YYYY.MM.DD and H.M, local, after now, within ten years
+//	EVERY <name> <duration>    a minute to a year
+//	DAILY <name> <time>        H.M (or H:M), local
+//
+// Nothing may follow a date or a time: "07.30junk" is no half past seven.
+func jobFrom(noun string, args []string, now time.Time) (Job, error) {
+	kind, ok := ParseJobKind(noun)
+	if !ok {
+		return Job{}, monolink.Fail(monolink.CodeNoun, "achtung makes TIMER, ALARM, EVERY and DAILY")
 	}
+	want := 2
+	if kind == KindAlarm {
+		want = 3
+	}
+	if len(args) != want {
+		return Job{}, monolink.Fail(monolink.CodeArgc, fmt.Sprintf("NEW:%s takes %d arguments", noun, want))
+	}
+	j := Job{Name: strings.TrimSpace(args[0]), Kind: kind}
+	if err := checkName(j.Name); err != nil {
+		return Job{}, monolink.Fail(monolink.CodeArg, err.Error())
+	}
+	switch kind {
+	case KindTimer, KindEvery:
+		least := time.Second
+		if kind == KindEvery {
+			least = minInterval
+		}
+		d, err := time.ParseDuration(strings.TrimSpace(args[1]))
+		if err != nil || d < least || d > maxAhead {
+			return Job{}, monolink.Fail("DUR", fmt.Sprintf("%q: a duration from %v to %v", args[1], least, maxAhead))
+		}
+		j.Due = now.Add(d)
+		if kind == KindEvery {
+			j.Interval = d
+		}
+	case KindAlarm:
+		at, err := parseTimeLocal(args[1], args[2])
+		if err != nil {
+			return Job{}, monolink.Fail("TIME", err.Error())
+		}
+		if !at.After(now) || at.After(now.Add(maxAlarmAhead)) {
+			return Job{}, monolink.Fail("TIME", "an alarm is after now, and within ten years")
+		}
+		j.Due = at
+	case KindDaily:
+		h, mi, err := parseClockLocal(args[1])
+		if err != nil {
+			return Job{}, monolink.Fail("TIME", err.Error())
+		}
+		j.AtHour, j.AtMin = h, mi
+		j.Due = nextDailyAfter(now, h, mi)
+	}
+	return j, nil
 }
 
-func (a *Achtung) cmdGet(req *monolink.Request) {
-	msg := req.Msg
-	switch msg.Noun {
+func (a *Achtung) cmdNew(m monolink.Message) (string, []string, error) {
+	j, err := jobFrom(m.Noun, m.Args, time.Now())
+	if err != nil {
+		return "", nil, err
+	}
+	if err := a.sched.Add(j); err != nil {
+		return "", nil, err
+	}
+	log.Info("NEW", "kind", j.Kind, "name", j.Name, "due", j.Due.Format(time.DateTime), "from", m.From)
+	return m.Noun, []string{j.Name}, nil
+}
+
+// cmdStop removes a job of that kind and name, and silences the buzzer —
+// also when there is no such job any more: a one-shot that fired is gone,
+// and STOP is how its ringing is stopped.
+func (a *Achtung) cmdStop(m monolink.Message) (string, []string, error) {
+	kind, ok := ParseJobKind(m.Noun)
+	if !ok {
+		return "", nil, monolink.Fail(monolink.CodeNoun, "achtung stops TIMER, ALARM, EVERY and DAILY")
+	}
+	if len(m.Args) != 1 {
+		return "", nil, monolink.Fail(monolink.CodeArgc, "STOP takes a name")
+	}
+	name := strings.TrimSpace(m.Args[0])
+	switch err := a.sched.Stop(name, kind); {
+	case err == nil:
+		log.Info("STOP", "kind", kind, "name", name, "from", m.From)
+	case errors.Is(err, errNoJob):
+		log.Debug("STOP: no such job; silencing", "kind", kind, "from", m.From)
+	default:
+		return "", nil, err
+	}
+	if err := a.silence(); err != nil {
+		log.Warn("BUZZER NOT TOLD OFF", "err", err)
+		return "", nil, monolink.Fail(monolink.CodeState, "the buzzer was not told OFF; STOP again")
+	}
+	return m.Noun, []string{name}, nil
+}
+
+func (a *Achtung) cmdGet(m monolink.Message) (string, []string, error) {
+	switch m.Noun {
 	case "LIST":
-		jobs := a.sched.List()
-		var parts []string
-		for _, j := range jobs {
-			if !j.Active {
-				continue
-			}
-			parts = append(parts, kindStr(j.Kind), j.Name)
+		if len(m.Args) > 1 {
+			return "", nil, monolink.Fail(monolink.CodeArgc, "LIST takes nothing, or the name the last page ended at")
 		}
-		log.Debug("GET LIST", "count", len(parts)/2, "from", msg.From)
-		if len(parts) == 0 {
-			req.Reply("OK", "LIST")
-			return
+		after := ""
+		if len(m.Args) == 1 {
+			after = m.Args[0]
 		}
-		req.Reply("OK", "LIST", parts...)
-
-	case "UPTIME":
-		uptime := time.Since(a.bootedAt).Truncate(time.Second)
-		log.Debug("GET UPTIME", "uptime", uptime, "from", msg.From)
-		req.Reply("OK", "UPTIME", uptime.String())
+		return "LIST", a.listAfter(after), nil
 
 	case "JOB":
-		if len(msg.Args) < 1 {
-			req.Reply("ERR", "ARGC")
-			return
+		if len(m.Args) != 1 {
+			return "", nil, monolink.Fail(monolink.CodeArgc, "JOB takes a name")
 		}
-		name := msg.Args[0]
-		j, ok := a.sched.Get(name)
-		if !ok || !j.Active {
-			log.Debug("GET JOB NOT FOUND", "name", name, "from", msg.From)
-			req.Reply("ERR", "NAC")
-			return
+		j, ok := a.sched.Get(strings.TrimSpace(m.Args[0]))
+		if !ok {
+			return "", nil, errNoJob
 		}
-		rem := time.Until(j.Due).Truncate(time.Second)
-		if rem < 0 {
-			rem = 0
-		}
-		log.Debug("GET JOB", "name", name, "kind", kindStr(j.Kind), "remaining", rem, "from", msg.From)
-		req.Reply("OK", "JOB", kindStr(j.Kind), j.Name, rem.String(), serializeTimeLocal(j.Due))
-
-	default:
-		log.Warn("UNKNOWN NOUN", "noun", msg.Noun, "from", msg.From)
-		req.Reply("ERR", "NOUN")
+		rem := max(time.Until(j.Due).Truncate(time.Second), 0)
+		return "JOB", []string{j.Kind.String(), j.Name, rem.String(), serializeTimeLocal(j.Due)}, nil
 	}
+	return "", nil, monolink.Fail(monolink.CodeNoun, "")
+}
+
+// listAfter is GET:LIST's answer: the jobs named after `after`, by name, a
+// kind and a name each, as many as one frame holds. A panel asks again
+// after the last name it got, until an answer comes back empty.
+func (a *Achtung) listAfter(after string) []string {
+	jobs := a.sched.List()
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Name < jobs[j].Name })
+	var out []string
+	for _, j := range jobs {
+		if j.Name > after && len(out) < 2*listPage {
+			out = append(out, j.Kind.String(), j.Name)
+		}
+	}
+	return out
 }
 
 func (a *Achtung) eventLoop() {
+	defer a.wg.Done()
 	for ev := range a.sched.Events() {
-		j := ev.Job
-		kind := kindStr(j.Kind)
-		log.Info("FIRE", "kind", kind, "name", j.Name)
-		a.client.Send("ALL", "FIRE", kind, j.Name)
-		a.client.Send("VERTEX", "ON", "BUZZ")
+		a.deliver(ev)
 	}
 }
 
-func kindStr(k JobKind) string { return k.String() }
+// deliver tells the bus a job fired, and the buzzer to sound — again and
+// again while the hub is out of reach, as when achtung starts before it
+// has connected, for up to lateFire, and not past Shutdown.
+func (a *Achtung) deliver(ev Event) {
+	kind := ev.Job.Kind.String()
+	log.Info("FIRE", "kind", kind, "name", ev.Job.Name)
+	for told := false; ; {
+		if !told {
+			told = a.client.Send("ALL", monolink.VerbFire, kind, ev.Job.Name) == nil
+		}
+		if told && a.buzz(ev) == nil {
+			return
+		}
+		if time.Since(ev.FiredAt) >= lateFire {
+			log.Warn("FIRE MISSED: the bus was out of reach", "kind", kind, "name", ev.Job.Name)
+			return
+		}
+		select {
+		case <-a.stop:
+			log.Warn("FIRE NOT DELIVERED: shutting down", "kind", kind, "name", ev.Job.Name)
+			return
+		case <-time.After(retryEvery):
+		}
+	}
+}
 
-// parseClockLocal reads a wire clock time. The wire has no colons inside
-// a field, so "H.M" is the canonical form; "H:M" is accepted too for
-// anything typed by hand.
+// buzz sounds the buzzer for ev — unless it was silenced after ev fired: a
+// STOP must not be undone by an alarm already on its way.
+func (a *Achtung) buzz(ev Event) error {
+	a.buzzMu.Lock()
+	defer a.buzzMu.Unlock()
+	if !ev.FiredAt.After(a.silenced) {
+		return nil
+	}
+	return a.client.Send("VERTEX", monolink.VerbSet, "BUZZ.STATE", "ON")
+}
+
+// silence turns the buzzer off, and keeps every job fired until now from
+// turning it on again.
+func (a *Achtung) silence() error {
+	a.buzzMu.Lock()
+	defer a.buzzMu.Unlock()
+	a.silenced = time.Now()
+	return a.client.Send("VERTEX", monolink.VerbSet, "BUZZ.STATE", "OFF")
+}
+
+// parseClockLocal reads a clock time, H.M — or H:M, as typed by hand — and
+// nothing after it.
 func parseClockLocal(s string) (hour, minute int, err error) {
-	norm := strings.ReplaceAll(s, ":", ".")
-	if _, err = fmt.Sscanf(norm, "%d.%d", &hour, &minute); err != nil {
-		return 0, 0, err
+	t, err := time.Parse("15.4", strings.ReplaceAll(strings.TrimSpace(s), ":", "."))
+	if err != nil {
+		return 0, 0, fmt.Errorf("time %q: want H.M", s)
 	}
-	if hour < 0 || hour > 23 || minute < 0 || minute > 59 {
-		return 0, 0, fmt.Errorf("clock out of range: %q", s)
-	}
-	return hour, minute, nil
+	return t.Hour(), t.Minute(), nil
 }
 
+// parseTimeLocal reads a date, YYYY.MM.DD, and a clock time, H.M, as local
+// time. A date that does not exist is refused, not rolled over; a time the
+// clocks skip that day comes the gap later.
 func parseTimeLocal(d, t string) (time.Time, error) {
-	var year, month, day, hour, minute int
-	_, err := fmt.Sscanf(d, "%d.%d.%d", &year, &month, &day)
+	day, err := time.ParseInLocation("2006.1.2", strings.TrimSpace(d), time.Local)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("date %q: want YYYY.MM.DD", d)
+	}
+	h, mi, err := parseClockLocal(t)
 	if err != nil {
 		return time.Time{}, err
 	}
-	_, err = fmt.Sscanf(t, "%d.%d", &hour, &minute)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return time.Date(year, time.Month(month), day, hour, minute, 0, 0, time.Local), nil
+	return time.Date(day.Year(), day.Month(), day.Day(), h, mi, 0, 0, time.Local), nil
 }
 
 // serializeTimeLocal renders a due time as a single wire token. It has to

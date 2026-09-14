@@ -11,129 +11,105 @@
 
   ───────────────────────────────────────────────────────────────
   ▓ OVERVIEW
-  **achtung** is a MONOLITH **node** written in **Go**.
-  ▪ Connects to **concentrator** over WebSocket (`ws://` or `wss://` with optional mTLS)
-  ▪ Runs one-shot timers and absolute-time alarms from wire commands
-  ▪ On fire, drives **vertex** (buzzer) and broadcasts to the network
+  **achtung** is a MONOLITH **node** at `ACHTUNG`, written in **Go**,
+  speaking monolink v2 only (SPEC.txt §27).
+  ▪ Timers, alarms, repeating and daily jobs, kept across restarts
+  ▪ When one fires: ALL:FIRE for whoever hears it, and vertex's buzzer on
+  ▪ Publishes JOBS.COUNT and NEXT, when the next job fires
 
-  ───────────────────────────────────────────────────────────────
-  ▓ ARCHITECTURE
-  ▪ **RUNTIME**: Go 1.24+ (see `go.mod`)
-  ▪ **TRANSPORT**: WebSocket (`github.com/MrZloHex/monolink`); optional **mTLS** to a `wss://` hub
-  ▪ **SCHEDULER**: Min-heap priority queue, single-goroutine event loop
-  ▪ **NODE ID**: `ACHTUNG`
-
-  ───────────────────────────────────────────────────────────────
-  ▓ FEATURES
-  ▪ One-shot timers (relative duration)
-  ▪ One-shot alarms (absolute date and time in local timezone)
-  ▪ Buzzer integration via **vertex**
-  ▪ Auto-reconnect on WebSocket disconnect
-  ▪ Uptime reporting
-  ▪ Ping/pong health check
-  ▪ Graceful shutdown on SIGINT/SIGTERM
-  ▪ Optional mTLS (client certificate) when using `wss://`
-  (Repeating intervals exist internally but are not exposed on the wire yet.)
-
-  ───────────────────────────────────────────────────────────────
-  ▓ REQUIREMENTS
-  ▪ Go 1.24+ (see `go.mod`)
+  It serves whoever the hub lets through. The enforcing concentrator holds
+  each panel to its person's grants — ACHTUNG.NEW.*, ACHTUNG.STOP.*,
+  ACHTUNG.GET.* — and each node to its policy line (SECURITY.txt §5);
+  achtung checks no identity of its own. Jobs are the household's, not
+  whoever made them: anyone allowed to STOP may stop any.
 
   ───────────────────────────────────────────────────────────────
   ▓ BUILD & RUN
-  **Build**
   ```sh
   go build -o bin/achtung ./cmd/achtung
-  ```
-
-  **Run**
-  ```sh
-  ./bin/achtung
-  ```
-  Defaults: hub `ws://localhost:8092`, log **info** — see **CONFIGURATION**.
-
-  **Example** (plain WebSocket)
-  ```sh
-  ./bin/achtung -u ws://localhost:8092 -l info
-  ```
-
-  **Example** (`wss://` + mTLS; paths may also come from `.env`)
-  ```sh
-  ./bin/achtung -u wss://hub.example:8092 \
-    --tls-cert /path/to/client.crt --tls-key /path/to/client.key
-  # optional: --tls-server-ca /path/to/ca.pem
+  go test ./...
+  ./bin/achtung --tls-cert achtung.pem --tls-key achtung.key --tls-server-ca bubble-ca.pem
   ```
 
   ───────────────────────────────────────────────────────────────
   ▓ CONFIGURATION
-  On startup, **achtung** loads a `.env` file from the current working directory if it exists (`godotenv`). Missing `.env` is fine; other read errors print a warning to stderr and the process continues. Environment variables supply **defaults for flags**; CLI arguments override them.
+  A `.env` in the working directory supplies defaults for flags; flags win.
 
-  **Environment**
-  ▪ `ACHTUNG_HUB_URL` — hub WebSocket URL (default `ws://localhost:8092`)
-  ▪ `ACHTUNG_LOG` — `debug`, `info`, `warn`, `error` (default `info`)
-  ▪ `ACHTUNG_TLS_CERT` — client certificate PEM (mTLS)
-  ▪ `ACHTUNG_TLS_KEY` — client private key PEM (mTLS)
-  ▪ `ACHTUNG_TLS_SERVER_CA` — optional PEM CA for the hub server cert; omit for system trust store
-  ▪ `ACHTUNG_JOBS` — job persistence file (default `jobs.json`); empty disables persistence
+    -u, --url            ACHTUNG_HUB_URL         wss://127.0.0.1:8443
+    -j, --jobs           ACHTUNG_JOBS            jobs.json   (empty: kept in memory only)
+        --tls-cert       ACHTUNG_TLS_CERT
+        --tls-key        ACHTUNG_TLS_KEY
+        --tls-server-ca  ACHTUNG_TLS_SERVER_CA   the bubble CA
+    -l, --log            ACHTUNG_LOG             info   (debug, info, warn, error)
 
-  With mTLS, the URL must be **`wss://`** and both **`ACHTUNG_TLS_CERT`** and **`ACHTUNG_TLS_KEY`** must be set (or equivalent `--tls-cert` / `--tls-key`).
-
-  **Flags**
-  ▪ `-u`, `--url` — hub URL (`ACHTUNG_HUB_URL`)
-  ▪ `-l`, `--log` — log level (`ACHTUNG_LOG`)
-  ▪ `--tls-cert` — client certificate PEM (`ACHTUNG_TLS_CERT`)
-  ▪ `--tls-key` — client private key PEM (`ACHTUNG_TLS_KEY`)
-  ▪ `--tls-server-ca` — optional hub server CA PEM (`ACHTUNG_TLS_SERVER_CA`)
-  ▪ `-j`, `--jobs` — job persistence file (`ACHTUNG_JOBS`)
-
-  **Persistence.** Jobs are written to `ACHTUNG_JOBS` after every change and
-  reloaded on boot, so a restart no longer loses them silently. One-shot
-  jobs whose time passed while the process was down are dropped rather than
-  fired at startup; repeating jobs are advanced to their next occurrence.
+  It does not start without a wss:// URL and all three TLS files: nodes
+  trust whoever the hub says sent a frame, so anything else at the hub's
+  port could arm and stop anything. An unknown log level is refused, and
+  so is a jobs file that cannot be right (STATE).
 
   ───────────────────────────────────────────────────────────────
   ▓ PROTOCOL
-  Packet format: `<TO>:<VERB>:<NOUN>[:<ARGS>...]:<FROM>`
+  v2 frames (`2:<id>:<from>:ACHTUNG:<verb>:<noun>[:<arg>...]`).
 
-  First field **TO** must be **`ACHTUNG`** for the daemon to handle the message (see `cmd/achtung`). Replies use **`FROM=ACHTUNG`** (e.g. `<peer>:OK:TIMER:<name>:ACHTUNG`). Errors use verb **`ERR`**.
+    NEW:TIMER:<name>:<duration>      -> OK:TIMER:<name>
+    NEW:ALARM:<name>:<date>:<time>   -> OK:ALARM:<name>
+    NEW:EVERY:<name>:<duration>      -> OK:EVERY:<name>
+    NEW:DAILY:<name>:<time>          -> OK:DAILY:<name>
+    STOP:<kind>:<name>               -> OK:<kind>:<name>
+    GET:LIST[:<after>]               -> OK:LIST[:<kind>:<name>...]
+    GET:JOB:<name>                   -> OK:JOB:<kind>:<name>:<remaining>:<due>
+    GET:JOBS.COUNT | NEXT | UPTIME | VERSION, PING   the object model's
 
-  ─── PING ───
-  `ACHTUNG:PING:PING:<from>` → `<from>:PONG:PONG:ACHTUNG`
+  ▪ <duration> is a Go duration (10s, 2h30m): a TIMER from a second to a
+    year, an EVERY from a minute to a year. <date> is YYYY.MM.DD, <time>
+    H.M (H:M typed by hand is read too), local; nothing may follow either.
+    An ALARM is after now and within ten years. A time the clocks skip
+    that day comes the gap later; one they repeat, once.
+  ▪ A <name> is what a person calls the job: at most 64 bytes, one line,
+    nothing invisible. NEW replaces a job of the same name — so a panel
+    edits a job by making it again. achtung keeps 256 jobs at most.
+  ▪ Repeating jobs skip occurrences missed while achtung was down rather
+    than replaying them; one-shots whose time passed meanwhile are dropped.
+  ▪ STOP removes the job of that kind and name — a STOP:TIMER does not
+    remove a DAILY — and silences the buzzer, also when there is no such
+    job any more: a one-shot that fired is gone, and STOP is how its
+    ringing ends. No job fired before a STOP sounds the buzzer after it.
+  ▪ GET:LIST gives jobs by name, eight to a reply (a kind and a name each,
+    sixteen arguments to a frame). Ask again with <after>, the last name
+    you got, until the answer is empty.
+  ▪ <remaining> is a Go duration; <due> is YYYY.MM.DD.HH.MM.
+  ▪ Requests are taken one at a time, in the order they arrived: a NEW
+    then a STOP are never done the other way round.
 
-  ─── NEW ───
-  `ACHTUNG:NEW:TIMER:<name>:<duration>:<from>` → `<from>:OK:TIMER:<name>:ACHTUNG`
-  `<duration>` — Go duration (e.g. `10s`, `2h30m`).
+  When a job fires, achtung sends `ALL:FIRE:<kind>:<name>` and
+  `VERTEX:SET:BUZZ.STATE:ON` — the property uart2ws registers for vertex.
+  While the hub is out of reach, as when achtung starts before it has
+  connected, it tries again every two seconds, for up to ten minutes: a
+  hub restarting is waited out, an alarm an hour late is not rung. Its
+  policy line lets it send `ALL.FIRE.* VERTEX.SET.BUZZ.STATE`.
 
-  `ACHTUNG:NEW:ALARM:<name>:<date>:<time>:<from>` → `<from>:OK:ALARM:<name>:ACHTUNG`
-  `<date>` — `Y.M.D` (e.g. `2026.4.9`). `<time>` — `H.M` in local time (e.g. `14.30`).
-
-  `ACHTUNG:NEW:EVERY:<name>:<duration>:<from>` → `<from>:OK:EVERY:<name>:ACHTUNG`
-  Repeats on an interval.
-
-  `ACHTUNG:NEW:DAILY:<name>:<time>:<from>` → `<from>:OK:DAILY:<name>:ACHTUNG`
-  Repeats at a local wall-clock `H.M`, so it stays put across DST.
-
-  Both repeating kinds skip occurrences missed while achtung was down
-  rather than replaying them.
-
-  ─── STOP ───
-  `ACHTUNG:STOP:TIMER:<name>:<from>` / `ACHTUNG:STOP:ALARM:<name>:<from>`
-  → `<from>:OK:TIMER:<name>:ACHTUNG` or `<from>:OK:ALARM:<name>:ACHTUNG`
-  Also sends `VERTEX:OFF:BUZZ:ACHTUNG` to silence the buzzer.
-
-  ─── GET ───
-  `ACHTUNG:GET:LIST:<from>` → `<from>:OK:LIST:ACHTUNG` or `<from>:OK:LIST:<kind>:<name>:...:ACHTUNG`
-  `ACHTUNG:GET:JOB:<name>:<from>` → `<from>:OK:JOB:<kind>:<name>:<remaining>:<due>:ACHTUNG` (`<due>` = `Y.M.D:H.M` local)
-  `ACHTUNG:GET:UPTIME:<from>` → `<from>:OK:UPTIME:<duration>:ACHTUNG`
-
-  ─── EVENTS (outbound) ───
-  When a job fires, **achtung** sends:
-  ▪ `ALL:FIRE:<KIND>:<name>:ACHTUNG` — broadcast
-  ▪ `VERTEX:ON:BUZZ:ACHTUNG` — buzzer on
+  Errors: ARGC, ARG (a name, or not a job), DUR, TIME, NOUN, VERB, NAC (no
+  such job, or one of another kind), BUSY (as many jobs as achtung keeps,
+  or shutting down), STATE (could not save; or the buzzer not told OFF —
+  STOP again).
 
   ───────────────────────────────────────────────────────────────
-  ▓ HUB (CONCENTRATOR)
-  The WebSocket hub is a separate binary (the **concentrator** module). It uses **`CONCENTRATOR_*`** for listen address and server TLS; see the concentrator README.
+  ▓ STATE
+  jobs.json, mode 0600. Each change is saved before it is answered, by
+  writing a new file beside the old and renaming it over: a crash or a full
+  disk leaves the old file or the new, never half of one, and a change
+  whose save failed is not made. What achtung changes by itself — a job
+  fired, a repeating one moved on — it saves at once, and if that fails,
+  again every ten seconds. A file that cannot be right — larger than
+  achtung writes, two jobs of one name, a job that is no job — stops
+  achtung with the file untouched, rather than let the next change write
+  over it with what was left.
+
+  ───────────────────────────────────────────────────────────────
+  ▓ DEPLOY
+  Through deploy/'s monolithctl, with MONOLITH's release: its own user, a
+  sandboxed unit, its key sealed, jobs.json in /var/lib/monolith/achtung
+  (deploy/README.txt).
 
   ───────────────────────────────────────────────────────────────
   ▓ FINAL WORDS
